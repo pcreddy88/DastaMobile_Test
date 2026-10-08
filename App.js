@@ -9024,90 +9024,25 @@ function CartScreen({ navigation, route }) {
   );
 }
 
-// ── CHECKOUT TIP (Clover, 2026-10-08) ─────────────────────────
-// "Add a tip?" -- your-order_embed3.html's yoShowTipPopup: No tip / 10% /
-// 15% / 20% / Custom, percent of the pre-tax subtotal. Custom takes a
-// dollar amount OR a percent; typing in one clears the other. A tip larger
-// than the subtotal is refused, same as web.
-const CHECKOUT_TIP_PCTS = [0, 10, 15, 20];
-function CheckoutTipModal({ subtotalCents, orderCents, initial, onContinue, onBack }) {
-  const [pending, setPending] = useState(initial.choice ?? 10);
-  const [usd, setUsd] = useState(initial.choice === 'custom' && !initial.customPct && initial.customCents
-    ? (initial.customCents / 100).toFixed(2) : '');
-  const [pct, setPct] = useState(initial.choice === 'custom' && initial.customPct ? String(initial.customPct) : '');
-  const [error, setError] = useState('');
-
-  const tipFor = (p) => Math.round(subtotalCents * p / 100);
-  const pctNum = parseFloat(pct);
-  const customPct = isFinite(pctNum) && pctNum > 0 ? pctNum : 0;
-  const usdNum = parseFloat(usd);
-  const cents = pending !== 'custom' ? tipFor(pending)
-    : customPct ? tipFor(customPct)
-    : isFinite(usdNum) && usdNum > 0 ? Math.round(usdNum * 100) : 0;
-
-  const go = () => {
-    if (cents > subtotalCents) { setError('That tip is more than the order itself.'); return; }
-    onContinue({ choice: pending, customPct: pending === 'custom' ? customPct : 0, customCents: pending === 'custom' ? cents : 0 });
-  };
-  const pick = (val) => { setPending(val); setError(''); };
-  const opts = [...CHECKOUT_TIP_PCTS.map(p => ({ val: p, label: p ? `${p}%` : 'No tip' })), { val: 'custom', label: 'Custom' }];
-
-  return (
-    <View style={S.modalOverlay}>
-      <Pressable style={StyleSheet.absoluteFill} onPress={onBack} />
-      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={{ width: '100%' }}>
-        <View style={S.modalSheet}>
-          <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ padding: 24 }}>
-            <Text style={S.confirmModalTitle}>Add a tip?</Text>
-            <Text style={S.confirmModalMessage}>100% of tips go to the team who made your order.</Text>
-            <View style={{ flexDirection: 'row', gap: 8, marginTop: 14 }}>
-              {opts.map(o => {
-                const on = pending === o.val;
-                return (
-                  <Pressable key={String(o.val)} onPress={() => pick(o.val)}
-                    accessibilityRole="radio" accessibilityState={{ checked: on }}
-                    style={{ flex: 1, paddingVertical: 10, paddingHorizontal: 2, borderRadius: 10, alignItems: 'center',
-                      borderWidth: 1.5, borderColor: on ? C.saffron : C.border, backgroundColor: on ? '#FDF0E8' : C.white }}>
-                    <Text style={{ color: C.charcoal, fontSize: 13, fontWeight: '600' }} numberOfLines={1} adjustsFontSizeToFit>{o.label}</Text>
-                  </Pressable>
-                );
-              })}
-            </View>
-            {pending === 'custom' && (
-              <View style={{ flexDirection: 'row', gap: 8, marginTop: 12 }}>
-                <TextInput style={[S.input, { flex: 1, marginBottom: 0 }]} value={usd} placeholder="$ Amount" placeholderTextColor={C.muted}
-                  keyboardType="decimal-pad" onChangeText={(v) => { setUsd(v); setPct(''); setError(''); }} />
-                <TextInput style={[S.input, { flex: 1, marginBottom: 0 }]} value={pct} placeholder="% Percent" placeholderTextColor={C.muted}
-                  keyboardType="decimal-pad" onChangeText={(v) => { setPct(v); setUsd(''); setError(''); }} />
-              </View>
-            )}
-            <Text style={[S.confirmModalMessage, { marginTop: 14 }]}>
-              Tip <Text style={{ fontWeight: '700' }}>${(cents / 100).toFixed(2)}</Text> · New total <Text style={{ fontWeight: '700' }}>${((orderCents + cents) / 100).toFixed(2)}</Text>
-            </Text>
-            {!!error && <Text style={{ color: '#C0392B', marginTop: 8 }}>{error}</Text>}
-            <View style={{ flexDirection: 'row', gap: 10, marginTop: 20 }}>
-              <Pressable style={({ pressed }) => [S.confirmModalCancelBtn, pressed && { opacity: 0.7 }]} onPress={onBack}>
-                <Text style={S.confirmModalCancelText}>Back</Text>
-              </Pressable>
-              <Pressable style={({ pressed }) => [S.confirmModalConfirmBtn, pressed && { backgroundColor: '#c95722' }]} onPress={go}>
-                <Text style={S.confirmModalConfirmText}>Continue</Text>
-              </Pressable>
-            </View>
-          </ScrollView>
-        </View>
-      </KeyboardAvoidingView>
-    </View>
-  );
+// Checkout tip buttons (Clover, 2026-10-08): percent of the pre-tax order
+// total after free drinks.
+const CHECKOUT_TIP_PCTS = [10, 15, 20];
+// "VISA" / "visa" -> "Visa" for the collapsed new-card row.
+const CARD_BRAND_LABELS = { visa: 'Visa', mastercard: 'Mastercard', mc: 'Mastercard', amex: 'Amex', american_express: 'Amex', americanexpress: 'Amex', discover: 'Discover' };
+function cardBrandLabel(brand) {
+  if (!brand) return 'Card';
+  const k = String(brand).toLowerCase().replace(/\s+/g, '_');
+  return CARD_BRAND_LABELS[k] || CARD_BRAND_LABELS[k.replace(/_/g, '')] || `${k[0].toUpperCase()}${k.slice(1).replace(/_/g, ' ')}`;
 }
 
 // ── CHECKOUT ──────────────────────────────────────────────────
 // Native rebuild of your-order_embed3.html's Payment step — same
-// GET /checkout/summary + POST /checkout/confirm contract, presenting
-// the Clover card sheet (via usePayWithCard) for the card
-// (card_amount_cents > 0) branch. The synchronous voucher/wallet-only
-// branch (card_amount_cents === 0) never takes a card at all, exactly
-// like web. Scheduled pickup times
-// aren't built yet (ASAP only) — flagged, not silently declared done.
+// GET /checkout/summary + POST /checkout/confirm contract. Everything is
+// chosen on this one screen (no popups after Pay): a saved card is charged
+// by /checkout/confirm itself; a new card is entered inline (Clover card
+// fields, tokenized by "Use this card") and charged right after via
+// POST /payments/clover/confirm. A free-drinks/Dasta-Card-only order
+// never takes a card at all, exactly like web.
 function CheckoutScreen({ navigation, route, onHeaderBack }) {
   const customer = route?.params?.customer || null;
   const cart = useCart();
@@ -9135,19 +9070,28 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
   const [giftCardCode, setGiftCardCode] = useState('');
   const clientRequestId = useRef(`${Date.now()}-${Math.random().toString(36).slice(2)}`);
   // Pay with (Clover, 2026-10-08) -- your-order_embed1.html's "Charge
-  // remainder to": a saved card's stripe_pm_id (the API's field name for
-  // the Clover card ref), or 'new' to enter a card in the pay sheet.
+  // remainder to": a saved card's card_ref, or 'new' for a card entered
+  // inline below.
   const [selectedTender, setSelectedTender] = useState('new');
   const [addCardOpen, setAddCardOpen] = useState(false);
   const [addCardIdentifier, setAddCardIdentifier] = useState(null);
-  // Tip (Clover, 2026-10-08) -- your-order_embed3.html's yoTip* flow: while
-  // summary.tips_enabled, the first Pay opens "Add a tip?" (10% preselected);
-  // Continue returns here with a Tip row, and the next Pay places the order.
-  const [tipChoice, setTipChoice] = useState(10); // 0 | 10 | 15 | 20 | 'custom'
-  const [tipCustomPct, setTipCustomPct] = useState(0);
-  const [tipCustomCents, setTipCustomCents] = useState(0);
-  const [tipChosen, setTipChosen] = useState(false);
-  const [tipOpen, setTipOpen] = useState(false);
+  // Inline new card: CloverCardFields until "Use this card" tokenizes it,
+  // then {token, card} (shown collapsed). cardFieldsKey remounts empty fields.
+  const cardFieldsRef = useRef(null);
+  const [cardFieldsKey, setCardFieldsKey] = useState(0);
+  const [cardFieldsReady, setCardFieldsReady] = useState(false);
+  const [newCard, setNewCard] = useState(null); // {token, card}
+  const [tokenizing, setTokenizing] = useState(false);
+  const [saveNewCard, setSaveNewCard] = useState(false);
+  const [cardError, setCardError] = useState('');
+  const [payError, setPayError] = useState('');
+  const [payLocked, setPayLocked] = useState(false); // 409: an earlier Pay is still being charged
+  // Tip (inline, Clover 2026-10-08): 0 (No tip) | 10 | 15 | 20 | 'custom'.
+  // Custom keeps both inputs' text; the last-edited one sets the amount.
+  const [tipChoice, setTipChoice] = useState(10);
+  const [tipUsdText, setTipUsdText] = useState('');
+  const [tipPctText, setTipPctText] = useState('');
+  const [tipLastEdited, setTipLastEdited] = useState('usd'); // 'usd' | 'pct'
   // My Circles group order (2026-09-27) -- when set, pickup is the group's
   // shared time (no ASAP/schedule choice) and group_order_id rides along
   // with /checkout/confirm, which re-checks the join cutoff server-side.
@@ -9226,12 +9170,15 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
     showInfo(title, message, () => navigation.navigate('MainTabs', { initialTab: 'Home' }));
   };
 
+  // A saved card's ref: card_ref, or the older stripe_pm_id name for the
+  // same Clover card ref until the API drops it.
+  const cardRefOf = (c) => c.card_ref || c.stripe_pm_id;
   // Same default as web: summary.default_tender, else the first saved card,
   // else a new card.
   const defaultTender = (s) => {
     const cards = s.saved_cards || [];
-    if (s.default_tender && cards.some(c => c.stripe_pm_id === s.default_tender)) return s.default_tender;
-    return cards[0]?.stripe_pm_id || 'new';
+    if (s.default_tender && cards.some(c => cardRefOf(c) === s.default_tender)) return s.default_tender;
+    return cards[0] ? cardRefOf(cards[0]) : 'new';
   };
 
   const load = async () => {
@@ -9261,16 +9208,16 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
     setAddCardIdentifier(id);
     setAddCardOpen(true);
   };
-  // Refresh only the summary (keeps free drinks, Dasta Cash, pickup and
+  // Refresh only the summary (keeps free drinks, Dasta Card, pickup and
   // gift card as the customer left them) and select the card just added.
   const refreshAfterCardAdded = async () => {
     const { ok, data } = await apiFetch('/checkout/summary');
     if (!ok || !data?.success) return;
-    const before = new Set((summary?.saved_cards || []).map(c => c.stripe_pm_id));
-    const added = (data.saved_cards || []).find(c => !before.has(c.stripe_pm_id));
-    const stillThere = selectedTender === 'new' || (data.saved_cards || []).some(c => c.stripe_pm_id === selectedTender);
+    const before = new Set((summary?.saved_cards || []).map(cardRefOf));
+    const added = (data.saved_cards || []).find(c => !before.has(cardRefOf(c)));
+    const stillThere = selectedTender === 'new' || (data.saved_cards || []).some(c => cardRefOf(c) === selectedTender);
     setSummary(data);
-    setSelectedTender(added ? added.stripe_pm_id : stillThere ? selectedTender : defaultTender(data));
+    setSelectedTender(added ? cardRefOf(added) : stillThere ? selectedTender : defaultTender(data));
   };
 
   const formatSlot = (iso) => {
@@ -9288,33 +9235,73 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
   const voucherPreview = summary?.voucher_previews?.[voucherCount] ?? summary?.voucher_previews?.[0];
   const totalCents = voucherPreview?.total_cents ?? summary?.total_cents_no_voucher;
   const taxCents = voucherPreview?.tax_cents ?? summary?.tax_cents_no_voucher;
-  // Tip + remainder, same maths as web's yoTipNow/yoComputeWaterfall: the
-  // tip is a percent of the pre-tax subtotal, added on top of the order;
-  // Dasta Cash then covers what it can and a card pays the rest.
+  // Tip + remainder, as web's yoComputeWaterfall: the tip is a percent of
+  // the pre-tax order total after free drinks, added on top of the order;
+  // Dasta Card then covers what it can and a card pays the rest.
   const tipsOn = !!summary?.tips_enabled;
-  const tipFor = (pct) => Math.round((summary?.subtotal_cents || 0) * pct / 100);
-  const tipCents = !tipsOn || !tipChosen ? 0
+  const tipBaseCents = Math.max(0, (summary?.subtotal_cents || 0) - (voucherPreview?.discount_cents || 0));
+  const tipFor = (pct) => Math.round(tipBaseCents * pct / 100);
+  const parseTipNum = (t) => { const v = parseFloat(t); return isFinite(v) && v > 0 ? v : 0; };
+  const tipCents = !tipsOn ? 0
     : tipChoice !== 'custom' ? tipFor(tipChoice)
-    : tipCustomPct ? tipFor(tipCustomPct) : (tipCustomCents || 0);
+    : tipLastEdited === 'pct' ? tipFor(parseTipNum(tipPctText))
+    : Math.round(parseTipNum(tipUsdText) * 100);
+  const tipTooBig = tipCents > tipBaseCents;
   const orderTotalCents = (totalCents || 0) + tipCents;
   const walletApplied = useWallet && summary?.wallet && orderTotalCents > 0
     ? Math.min(summary.wallet.total_cents || 0, orderTotalCents) : 0;
   const cardAmountCents = orderTotalCents - walletApplied;
-  const tipLabel = !tipChosen ? '' : tipChoice === 'custom'
-    ? ` · custom${tipCustomPct ? ` ${tipCustomPct}%` : ''}` : tipChoice ? ` · ${tipChoice}%` : ' · none';
+  const fmt = (cents) => `$${((cents || 0) / 100).toFixed(2)}`;
+  // Custom inputs fill each other: % -> $ to the cent, $ -> % to one decimal.
+  const onTipPct = (t) => {
+    setTipPctText(t); setTipLastEdited('pct');
+    const v = parseTipNum(t);
+    setTipUsdText(v ? (tipFor(v) / 100).toFixed(2) : '');
+  };
+  const onTipUsd = (t) => {
+    setTipUsdText(t); setTipLastEdited('usd');
+    const v = parseTipNum(t);
+    setTipPctText(v && tipBaseCents ? (Math.round(v * 100) / tipBaseCents * 100).toFixed(1) : '');
+  };
+
+  // "Use this card": tokenize the inline fields and collapse them.
+  const tokenizeNewCard = async () => {
+    if (!cardFieldsRef.current) return null;
+    setTokenizing(true); setCardError('');
+    const t = await cardFieldsRef.current.tokenize();
+    setTokenizing(false);
+    if (!t.ok) { setCardError(t.error || 'Please check your card details.'); return null; }
+    const nc = { token: t.token, card: t.card };
+    setNewCard(nc);
+    return nc;
+  };
+  // "Change" (or a decline): back to empty fields.
+  const reopenCardFields = () => {
+    setNewCard(null); setCardFieldsReady(false); setCardFieldsKey(k => k + 1);
+  };
 
   // goOverride: the group order just joined from the safety-net prompt
   // (the context update hasn't re-rendered yet).
   const handlePay = async (goOverride) => {
     const go = goOverride?.group_order_id ? goOverride : groupOrder;
-    if (!go && pickupType === 'scheduled' && !scheduledTime) { showInfo('Pick a time', 'Please choose a pickup time.'); return; }
+    if (!go && pickupType === 'scheduled' && !scheduledTime) { setPayError('Please choose a pickup time.'); return; }
     if ((giftCardNumber.trim() || giftCardCode.trim()) && !(giftCardNumber.trim() && giftCardCode.trim())) {
-      showInfo('Gift Card', 'Please enter both the gift card number and its redemption code.');
+      setPayError('Please enter both the gift card number and its redemption code.');
       return;
     }
-    if (tipsOn && !tipChosen) { setTipOpen(true); return; } // tip first, then back to checkout
+    if (tipTooBig) { setPayError('That tip is more than the order itself.'); return; }
+    // A new card must be entered before Pay; if the fields are filled in
+    // but "Use this card" wasn't tapped, tokenize them now.
+    let card = selectedTender === 'new' ? newCard : null;
+    if (cardAmountCents > 0 && selectedTender === 'new' && !card) {
+      if (!cardFieldsReady) { setPayError('Enter your card details above.'); return; }
+      setPaying(true); setPayError('');
+      card = await tokenizeNewCard();
+      setPaying(false);
+      if (!card) { setPayError('Please check your card details above.'); return; }
+    }
     if (!go && groupOffer && !groupOfferDeclined.current) { setGroupOfferOpen(true); return; }
-    setPaying(true);
+    setPaying(true); setPayError('');
     try {
       const { ok, data } = await apiFetch('/checkout/confirm', {
         method: 'POST',
@@ -9327,12 +9314,12 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
           gift_card_number: giftCardNumber.trim() || undefined,
           gift_card_redeem_code: giftCardCode.trim() || undefined,
           // A saved card is charged server-side right away; left out for a
-          // new card, which the pay sheet collects next.
-          stripe_pm_id: selectedTender !== 'new' ? selectedTender : undefined,
+          // new card, which is charged next via /payments/clover/confirm.
+          card_ref: selectedTender !== 'new' ? selectedTender : undefined,
           tip_cents: tipCents,
         },
       });
-      if (!ok) { showInfo('Error', data?.detail || 'Could not place your order.'); return; }
+      if (!ok) { setPayError(data?.detail || 'Could not place your order.'); return; }
       if (data.status === 'confirmed') {
         cart.refreshCounts();
         // onOk defers the navigate() until the InfoModal is dismissed --
@@ -9350,18 +9337,42 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
         setTimeout(() => cart.refreshCounts(), 6000);
         afterPaid('Order Placed! ☕', 'Payment received — your order is confirmed.', go);
       };
-      if (data.clover) {
-        const result = await payWithCard(data);
-        if (result.canceled) return;
-        if (!result.ok) { showInfo('Payment Error', result.error || 'Could not complete payment.'); return; }
-        paid();
-        return;
-      }
       // Saved card charged (or, for a group order, authorized) server-side
       // -- nothing left for the customer to do.
       if (data.payment_status === 'succeeded' || data.payment_status === 'requires_capture') { paid(); return; }
-      showInfo('Payment Error', data.detail || 'Could not start your payment. Please try again.');
-    } catch { showInfo('Error', 'Could not reach Dasta server.'); }
+      if (data.clover && data.payment_ref) {
+        // New card entered above: charge it now, no card sheet. Success also
+        // covers status authorized (a group-order hold).
+        if (card) {
+          const res = await apiFetch('/payments/clover/confirm', {
+            method: 'POST',
+            body: { payment_ref: data.payment_ref, token: card.token, card: card.card, save_card: saveNewCard },
+            timeoutMs: 45000,
+          });
+          if (res.ok && res.data?.success) { paid(); return; }
+          if (res.status === 409) {
+            setPayLocked(true);
+            setPayError(`${res.data?.detail || 'This payment is already being processed.'} Check your order history in a minute.`);
+            return;
+          }
+          // Declined or expired token: fresh fields, Pay again (same
+          // client_request_id, so it's still the same order).
+          reopenCardFields();
+          setPayError(res.data?.detail || (res.networkError
+            ? "We couldn't reach Dasta to confirm your payment. Please check your connection and try again."
+            : 'Your card could not be charged. Please re-enter it and try again.'));
+          return;
+        }
+        // No card entered here (e.g. Dasta Card or a gift card looked like
+        // enough, but the server still wants a card) -- fall back to the sheet.
+        const result = await payWithCard(data);
+        if (result.canceled) return;
+        if (!result.ok) { setPayError(result.error || 'Could not complete payment.'); return; }
+        paid();
+        return;
+      }
+      setPayError(data.detail || 'Could not start your payment. Please try again.');
+    } catch { setPayError('Could not reach Dasta server.'); }
     finally { setPaying(false); }
   };
 
@@ -9430,12 +9441,12 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
         {summary.wallet?.total_cents > 0 && (
           <Pressable style={[S.profileMenuRow, { justifyContent: 'space-between', backgroundColor: C.white, borderRadius: 10, marginTop: 12 }]}
             onPress={() => setUseWallet(v => !v)}>
-            <Text style={S.profileMenuRowText}>Use Dasta Cash (${(summary.wallet.total_cents / 100).toFixed(2)})</Text>
+            <Text style={S.profileMenuRowText}>Use Dasta Card ({fmt(summary.wallet.total_cents)})</Text>
             <Switch value={useWallet} onValueChange={setUseWallet} trackColor={{ false: C.border, true: C.saffron }} thumbColor={C.white} />
           </Pressable>
         )}
 
-        {/* Pay with -- shown whenever free drinks and Dasta Cash leave
+        {/* Pay with -- shown whenever free drinks and Dasta Card leave
             something to pay, same rule as web's "Charge remainder to". */}
         {cardAmountCents > 0 && (
           <View style={{ marginTop: 16 }}>
@@ -9446,11 +9457,11 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
               </Pressable>
             </View>
             <View style={{ backgroundColor: C.white, borderRadius: 10, overflow: 'hidden' }}>
-              {[...(summary.saved_cards || []).map(c => ({ value: c.stripe_pm_id, label: c.display })),
+              {[...(summary.saved_cards || []).map(c => ({ value: cardRefOf(c), label: c.display })),
                 { value: 'new', label: 'Use a new card' }].map((t, i) => {
                 const on = selectedTender === t.value;
                 return (
-                  <Pressable key={t.value} disabled={paying} onPress={() => setSelectedTender(t.value)}
+                  <Pressable key={t.value} disabled={paying} onPress={() => { if (t.value === 'new' && selectedTender !== 'new') setCardFieldsReady(false); setSelectedTender(t.value); setPayError(''); }}
                     accessibilityRole="radio" accessibilityState={{ checked: on }}
                     style={[S.profileMenuRow, { gap: 10 }, i > 0 && { borderTopWidth: 1, borderTopColor: C.border }]}>
                     <Ionicons name={on ? 'radio-button-on' : 'radio-button-off'} size={20} color={on ? C.saffron : C.muted} />
@@ -9458,24 +9469,77 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
                   </Pressable>
                 );
               })}
+              {selectedTender === 'new' && (
+                <View style={{ paddingHorizontal: 16, paddingBottom: 14, borderTopWidth: 1, borderTopColor: C.border }}>
+                  {newCard ? (
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingTop: 12 }}>
+                      <Ionicons name="card-outline" size={20} color={C.saffron} />
+                      <Text style={[S.profileMenuRowText, { flex: 1 }]}>
+                        {cardBrandLabel(newCard.card?.brand)} •••• {newCard.card?.last4 || '····'} (new card)
+                      </Text>
+                      <Pressable onPress={reopenCardFields} disabled={paying} hitSlop={8}>
+                        <Text style={[S.linkText, { marginTop: 0 }]}>Change</Text>
+                      </Pressable>
+                    </View>
+                  ) : (
+                    <>
+                      <CloverCardFields key={cardFieldsKey} ref={cardFieldsRef} onReady={() => setCardFieldsReady(true)} />
+                      <Pressable style={[S.btnSaffron, { marginTop: 10, marginBottom: 0 }, (!cardFieldsReady || tokenizing || paying) && { opacity: 0.6 }]}
+                        disabled={!cardFieldsReady || tokenizing || paying} onPress={() => { setPayError(''); tokenizeNewCard(); }}>
+                        {tokenizing ? <ActivityIndicator color={C.ivory} /> : <Text style={S.btnSaffronText}>Use this card</Text>}
+                      </Pressable>
+                    </>
+                  )}
+                  {!!cardError && !newCard && <Text style={{ color: '#C0392B', marginTop: 8 }}>{cardError}</Text>}
+                  <Pressable disabled={paying} onPress={() => setSaveNewCard(v => !v)}
+                    accessibilityRole="checkbox" accessibilityState={{ checked: saveNewCard }}
+                    style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingTop: 12 }}>
+                    <Ionicons name={saveNewCard ? 'checkbox' : 'square-outline'} size={20} color={saveNewCard ? C.saffron : C.muted} />
+                    <Text style={S.profileMenuRowText}>Save this card for next time</Text>
+                  </Pressable>
+                </View>
+              )}
             </View>
           </View>
         )}
 
-        <View style={{ marginTop: 20, gap: 6 }}>
-          <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={S.cardSub}>Subtotal</Text><Text style={S.cardSub}>${(summary.subtotal_cents / 100).toFixed(2)}</Text></View>
-          <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={S.cardSub}>Tax</Text><Text style={S.cardSub}>${((taxCents || 0) / 100).toFixed(2)}</Text></View>
-          {tipsOn && (
-            <>
-              <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={S.cardSub}>Order total</Text><Text style={S.cardSub}>${((totalCents || 0) / 100).toFixed(2)}</Text></View>
-              <Pressable onPress={() => setTipOpen(true)} disabled={paying} style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
-                <Text style={S.cardSub}>Tip{tipLabel} <Text style={{ color: C.saffron, fontWeight: '600' }}>{tipChosen ? 'Change' : 'Add'} ›</Text></Text>
-                <Text style={S.cardSub}>${(tipCents / 100).toFixed(2)}</Text>
-              </Pressable>
-            </>
-          )}
-          <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 4 }}><Text style={S.secTitle}>Total</Text><Text style={S.secTitle}>${(orderTotalCents / 100).toFixed(2)}</Text></View>
-        </View>
+        {/* Add a tip -- inline (no popup). Percent of the pre-tax order
+            total after free drinks; exactly one choice, 10% to start. */}
+        {tipsOn && (
+          <View style={{ marginTop: 16 }}>
+            <Text style={S.fieldLabel}>Add a tip</Text>
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+              {[{ val: 0, label: 'No tip' },
+                ...CHECKOUT_TIP_PCTS.map(p => ({ val: p, label: `${p}% · ${fmt(tipFor(p))}` })),
+                { val: 'custom', label: 'Custom' }].map(o => {
+                const on = tipChoice === o.val;
+                return (
+                  <Pressable key={String(o.val)} disabled={paying} onPress={() => { setTipChoice(o.val); setPayError(''); }}
+                    accessibilityRole="radio" accessibilityState={{ checked: on }}
+                    style={{ flexBasis: '47%', flexGrow: 1, minHeight: 52, borderRadius: 12, alignItems: 'center', justifyContent: 'center',
+                      paddingHorizontal: 8, borderWidth: 1.5, borderColor: on ? C.saffron : C.border, backgroundColor: on ? C.saffron : C.white }}>
+                    <Text style={{ color: on ? C.white : C.charcoal, fontSize: 15, fontWeight: '700' }}>{o.label}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+            {tipChoice === 'custom' && (
+              <View style={{ flexDirection: 'row', gap: 8, marginTop: 10 }}>
+                <View style={[S.input, { flex: 1, flexDirection: 'row', alignItems: 'center', marginBottom: 0 }]}>
+                  <Text style={{ color: C.charcoal, fontSize: 15, marginRight: 4 }}>$</Text>
+                  <TextInput style={{ flex: 1, padding: 0, color: C.charcoal, fontSize: 15 }} value={tipUsdText} onChangeText={onTipUsd}
+                    placeholder="0.00" placeholderTextColor={C.muted} keyboardType="decimal-pad" editable={!paying} />
+                </View>
+                <View style={[S.input, { flex: 1, flexDirection: 'row', alignItems: 'center', marginBottom: 0 }]}>
+                  <TextInput style={{ flex: 1, padding: 0, color: C.charcoal, fontSize: 15 }} value={tipPctText} onChangeText={onTipPct}
+                    placeholder="0" placeholderTextColor={C.muted} keyboardType="decimal-pad" editable={!paying} />
+                  <Text style={{ color: C.charcoal, fontSize: 15, marginLeft: 4 }}>%</Text>
+                </View>
+              </View>
+            )}
+            {tipTooBig && <Text style={{ color: '#C0392B', marginTop: 8 }}>That tip is more than the order itself.</Text>}
+          </View>
+        )}
 
         {groupOrder ? (
           <>
@@ -9523,9 +9587,20 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
           </View>
         )}
 
-        <Pressable style={[S.btnSaffron, { marginTop: 20 }]} disabled={paying} onPress={() => handlePay()}>
+
+        <View style={{ marginTop: 20, gap: 6 }}>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={S.cardSub}>Subtotal</Text><Text style={S.cardSub}>${(summary.subtotal_cents / 100).toFixed(2)}</Text></View>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={S.cardSub}>Tax</Text><Text style={S.cardSub}>${((taxCents || 0) / 100).toFixed(2)}</Text></View>
+          {tipsOn && (
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={S.cardSub}>Tip</Text><Text style={S.cardSub}>{fmt(tipCents)}</Text></View>
+          )}
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 4 }}><Text style={S.secTitle}>Total</Text><Text style={S.secTitle}>{fmt(orderTotalCents)}</Text></View>
+        </View>
+
+        {!!payError && <Text style={{ color: '#C0392B', marginTop: 16, textAlign: 'center' }}>{payError}</Text>}
+        <Pressable style={[S.btnSaffron, { marginTop: 20 }, (payLocked || tipTooBig) && { opacity: 0.6 }]} disabled={paying || payLocked || tipTooBig} onPress={() => handlePay()}>
           {paying ? <ActivityIndicator color={C.ivory} /> : (
-            <Text style={S.btnSaffronText}>{orderTotalCents === 0 ? '✅ Place Order' : `💳 Pay $${(orderTotalCents / 100).toFixed(2)}`}</Text>
+            <Text style={S.btnSaffronText}>{orderTotalCents === 0 ? '✅ Place Order' : `💳 Pay ${fmt(orderTotalCents)}`}</Text>
           )}
         </Pressable>
       </View>
@@ -9538,18 +9613,6 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
       buttonLabel={infoModal?.buttonLabel}
       onClose={() => { const cb = infoModal?.onOk; setInfoModal(null); cb?.(); }}
     />
-    {tipOpen && (
-      <CheckoutTipModal
-        subtotalCents={summary.subtotal_cents || 0}
-        orderCents={totalCents || 0}
-        initial={{ choice: tipChoice, customPct: tipCustomPct, customCents: tipCustomCents }}
-        onBack={() => setTipOpen(false)}
-        onContinue={({ choice, customPct, customCents }) => {
-          setTipChoice(choice); setTipCustomPct(customPct); setTipCustomCents(customCents);
-          setTipChosen(true); setTipOpen(false);
-        }}
-      />
-    )}
     <AddCardModal
       visible={addCardOpen}
       onClose={() => setAddCardOpen(false)}
