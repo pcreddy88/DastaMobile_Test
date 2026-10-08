@@ -28,6 +28,7 @@
     "production": {
       "ios": {
         "appleId": "info@dastacafe.com",
+        "ascAppId": "6820682975",
         "appleTeamId": "5HS4BHJRAJ"
       }
     }
