@@ -1,15 +1,12 @@
 {
   "expo": {
-    "name": "Dasta",
-    "slug": "DastaNew",
+    "name": "Dasta Test",
+    "slug": "DastaTest",
     "version": "1.2.0",
-    "scheme": "dastasipsense",
+    "scheme": "dastasipsensetest",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
-    "updates": {
-      "url": "https://u.expo.dev/84b432c9-cb11-44a1-a96d-a906ef6f75c7"
-    },
     "runtimeVersion": {
       "policy": "appVersion"
     },
@@ -20,8 +17,8 @@
     },
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "com.dasta.sipsense",
-      "associatedDomains": ["applinks:api.dastacafe.com"],
+      "bundleIdentifier": "com.dasta.sipsense.test",
+      "associatedDomains": ["applinks:api.test.dastacafe.com"],
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
         "NSLocationWhenInUseUsageDescription": "Used to find the nearest Dasta café and get directions.",
@@ -32,15 +29,9 @@
         ]
       }
     },
-    "extra": {
-      "eas": {
-        "projectId": "84b432c9-cb11-44a1-a96d-a906ef6f75c7"
-      }
-    },
     "android": {
-      "package": "com.dasta.sipsense",
+      "package": "com.dasta.sipsense.test",
       "softwareKeyboardLayoutMode": "resize",
-      "googleServicesFile": "./google-services.json",
       "versionCode": 1,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
@@ -49,7 +40,7 @@
       "intentFilters": [
         {
           "action": "VIEW",
-          "data": [{ "scheme": "dastasipsense" }],
+          "data": [{ "scheme": "dastasipsensetest" }],
           "category": ["BROWSABLE", "DEFAULT"]
         },
         {
@@ -58,7 +49,7 @@
           "data": [
             {
               "scheme": "https",
-              "host": "api.dastacafe.com",
+              "host": "api.test.dastacafe.com",
               "pathPrefix": "/dasta-circle"
             }
           ],
@@ -96,13 +87,6 @@
         }
       ],
       "expo-secure-store",
-      [
-        "@stripe/stripe-react-native",
-        {
-          "merchantIdentifier": "merchant.com.dasta.sipsense",
-          "enableGooglePay": true
-        }
-      ],
       "expo-font",
       [
         "expo-audio",
