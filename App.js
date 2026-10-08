@@ -9024,6 +9024,82 @@ function CartScreen({ navigation, route }) {
   );
 }
 
+// ── CHECKOUT TIP (Clover, 2026-10-08) ─────────────────────────
+// "Add a tip?" -- your-order_embed3.html's yoShowTipPopup: No tip / 10% /
+// 15% / 20% / Custom, percent of the pre-tax subtotal. Custom takes a
+// dollar amount OR a percent; typing in one clears the other. A tip larger
+// than the subtotal is refused, same as web.
+const CHECKOUT_TIP_PCTS = [0, 10, 15, 20];
+function CheckoutTipModal({ subtotalCents, orderCents, initial, onContinue, onBack }) {
+  const [pending, setPending] = useState(initial.choice ?? 10);
+  const [usd, setUsd] = useState(initial.choice === 'custom' && !initial.customPct && initial.customCents
+    ? (initial.customCents / 100).toFixed(2) : '');
+  const [pct, setPct] = useState(initial.choice === 'custom' && initial.customPct ? String(initial.customPct) : '');
+  const [error, setError] = useState('');
+
+  const tipFor = (p) => Math.round(subtotalCents * p / 100);
+  const pctNum = parseFloat(pct);
+  const customPct = isFinite(pctNum) && pctNum > 0 ? pctNum : 0;
+  const usdNum = parseFloat(usd);
+  const cents = pending !== 'custom' ? tipFor(pending)
+    : customPct ? tipFor(customPct)
+    : isFinite(usdNum) && usdNum > 0 ? Math.round(usdNum * 100) : 0;
+
+  const go = () => {
+    if (cents > subtotalCents) { setError('That tip is more than the order itself.'); return; }
+    onContinue({ choice: pending, customPct: pending === 'custom' ? customPct : 0, customCents: pending === 'custom' ? cents : 0 });
+  };
+  const pick = (val) => { setPending(val); setError(''); };
+  const opts = [...CHECKOUT_TIP_PCTS.map(p => ({ val: p, label: p ? `${p}%` : 'No tip' })), { val: 'custom', label: 'Custom' }];
+
+  return (
+    <View style={S.modalOverlay}>
+      <Pressable style={StyleSheet.absoluteFill} onPress={onBack} />
+      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={{ width: '100%' }}>
+        <View style={S.modalSheet}>
+          <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ padding: 24 }}>
+            <Text style={S.confirmModalTitle}>Add a tip?</Text>
+            <Text style={S.confirmModalMessage}>100% of tips go to the team who made your order.</Text>
+            <View style={{ flexDirection: 'row', gap: 8, marginTop: 14 }}>
+              {opts.map(o => {
+                const on = pending === o.val;
+                return (
+                  <Pressable key={String(o.val)} onPress={() => pick(o.val)}
+                    accessibilityRole="radio" accessibilityState={{ checked: on }}
+                    style={{ flex: 1, paddingVertical: 10, paddingHorizontal: 2, borderRadius: 10, alignItems: 'center',
+                      borderWidth: 1.5, borderColor: on ? C.saffron : C.border, backgroundColor: on ? '#FDF0E8' : C.white }}>
+                    <Text style={{ color: C.charcoal, fontSize: 13, fontWeight: '600' }} numberOfLines={1} adjustsFontSizeToFit>{o.label}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+            {pending === 'custom' && (
+              <View style={{ flexDirection: 'row', gap: 8, marginTop: 12 }}>
+                <TextInput style={[S.input, { flex: 1, marginBottom: 0 }]} value={usd} placeholder="$ Amount" placeholderTextColor={C.muted}
+                  keyboardType="decimal-pad" onChangeText={(v) => { setUsd(v); setPct(''); setError(''); }} />
+                <TextInput style={[S.input, { flex: 1, marginBottom: 0 }]} value={pct} placeholder="% Percent" placeholderTextColor={C.muted}
+                  keyboardType="decimal-pad" onChangeText={(v) => { setPct(v); setUsd(''); setError(''); }} />
+              </View>
+            )}
+            <Text style={[S.confirmModalMessage, { marginTop: 14 }]}>
+              Tip <Text style={{ fontWeight: '700' }}>${(cents / 100).toFixed(2)}</Text> · New total <Text style={{ fontWeight: '700' }}>${((orderCents + cents) / 100).toFixed(2)}</Text>
+            </Text>
+            {!!error && <Text style={{ color: '#C0392B', marginTop: 8 }}>{error}</Text>}
+            <View style={{ flexDirection: 'row', gap: 10, marginTop: 20 }}>
+              <Pressable style={({ pressed }) => [S.confirmModalCancelBtn, pressed && { opacity: 0.7 }]} onPress={onBack}>
+                <Text style={S.confirmModalCancelText}>Back</Text>
+              </Pressable>
+              <Pressable style={({ pressed }) => [S.confirmModalConfirmBtn, pressed && { backgroundColor: '#c95722' }]} onPress={go}>
+                <Text style={S.confirmModalConfirmText}>Continue</Text>
+              </Pressable>
+            </View>
+          </ScrollView>
+        </View>
+      </KeyboardAvoidingView>
+    </View>
+  );
+}
+
 // ── CHECKOUT ──────────────────────────────────────────────────
 // Native rebuild of your-order_embed3.html's Payment step — same
 // GET /checkout/summary + POST /checkout/confirm contract, presenting
@@ -9058,6 +9134,20 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
   const [giftCardNumber, setGiftCardNumber] = useState('');
   const [giftCardCode, setGiftCardCode] = useState('');
   const clientRequestId = useRef(`${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  // Pay with (Clover, 2026-10-08) -- your-order_embed1.html's "Charge
+  // remainder to": a saved card's stripe_pm_id (the API's field name for
+  // the Clover card ref), or 'new' to enter a card in the pay sheet.
+  const [selectedTender, setSelectedTender] = useState('new');
+  const [addCardOpen, setAddCardOpen] = useState(false);
+  const [addCardIdentifier, setAddCardIdentifier] = useState(null);
+  // Tip (Clover, 2026-10-08) -- your-order_embed3.html's yoTip* flow: while
+  // summary.tips_enabled, the first Pay opens "Add a tip?" (10% preselected);
+  // Continue returns here with a Tip row, and the next Pay places the order.
+  const [tipChoice, setTipChoice] = useState(10); // 0 | 10 | 15 | 20 | 'custom'
+  const [tipCustomPct, setTipCustomPct] = useState(0);
+  const [tipCustomCents, setTipCustomCents] = useState(0);
+  const [tipChosen, setTipChosen] = useState(false);
+  const [tipOpen, setTipOpen] = useState(false);
   // My Circles group order (2026-09-27) -- when set, pickup is the group's
   // shared time (no ASAP/schedule choice) and group_order_id rides along
   // with /checkout/confirm, which re-checks the join cutoff server-side.
@@ -9136,6 +9226,14 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
     showInfo(title, message, () => navigation.navigate('MainTabs', { initialTab: 'Home' }));
   };
 
+  // Same default as web: summary.default_tender, else the first saved card,
+  // else a new card.
+  const defaultTender = (s) => {
+    const cards = s.saved_cards || [];
+    if (s.default_tender && cards.some(c => c.stripe_pm_id === s.default_tender)) return s.default_tender;
+    return cards[0]?.stripe_pm_id || 'new';
+  };
+
   const load = async () => {
     setLoading(true);
     const { ok, data } = await apiFetch('/checkout/summary');
@@ -9143,6 +9241,7 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
       setSummary(data);
       setVoucherCount(data.voucher_default_count || 0);
       setUseWallet(!!data.wallet?.default_checked);
+      setSelectedTender(defaultTender(data));
       if (!data.is_open_now && data.pickup_slots?.length) {
         setPickupType('scheduled');
         setScheduledTime(data.pickup_slots[0]);
@@ -9151,6 +9250,28 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
     setLoading(false);
   };
   useEffect(() => { load(); }, []);
+
+  // "+ Add a card": AddCardModal's re-auth needs the customer's phone/email.
+  const openAddCard = async () => {
+    let id = customer?.phone || customer?.email || null;
+    if (!id) {
+      const { ok, data } = await apiFetch('/auth/me');
+      if (ok && data?.success) id = data.customer?.phone || data.customer?.email || null;
+    }
+    setAddCardIdentifier(id);
+    setAddCardOpen(true);
+  };
+  // Refresh only the summary (keeps free drinks, Dasta Cash, pickup and
+  // gift card as the customer left them) and select the card just added.
+  const refreshAfterCardAdded = async () => {
+    const { ok, data } = await apiFetch('/checkout/summary');
+    if (!ok || !data?.success) return;
+    const before = new Set((summary?.saved_cards || []).map(c => c.stripe_pm_id));
+    const added = (data.saved_cards || []).find(c => !before.has(c.stripe_pm_id));
+    const stillThere = selectedTender === 'new' || (data.saved_cards || []).some(c => c.stripe_pm_id === selectedTender);
+    setSummary(data);
+    setSelectedTender(added ? added.stripe_pm_id : stillThere ? selectedTender : defaultTender(data));
+  };
 
   const formatSlot = (iso) => {
     const dt = new Date(iso);
@@ -9167,6 +9288,20 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
   const voucherPreview = summary?.voucher_previews?.[voucherCount] ?? summary?.voucher_previews?.[0];
   const totalCents = voucherPreview?.total_cents ?? summary?.total_cents_no_voucher;
   const taxCents = voucherPreview?.tax_cents ?? summary?.tax_cents_no_voucher;
+  // Tip + remainder, same maths as web's yoTipNow/yoComputeWaterfall: the
+  // tip is a percent of the pre-tax subtotal, added on top of the order;
+  // Dasta Cash then covers what it can and a card pays the rest.
+  const tipsOn = !!summary?.tips_enabled;
+  const tipFor = (pct) => Math.round((summary?.subtotal_cents || 0) * pct / 100);
+  const tipCents = !tipsOn || !tipChosen ? 0
+    : tipChoice !== 'custom' ? tipFor(tipChoice)
+    : tipCustomPct ? tipFor(tipCustomPct) : (tipCustomCents || 0);
+  const orderTotalCents = (totalCents || 0) + tipCents;
+  const walletApplied = useWallet && summary?.wallet && orderTotalCents > 0
+    ? Math.min(summary.wallet.total_cents || 0, orderTotalCents) : 0;
+  const cardAmountCents = orderTotalCents - walletApplied;
+  const tipLabel = !tipChosen ? '' : tipChoice === 'custom'
+    ? ` · custom${tipCustomPct ? ` ${tipCustomPct}%` : ''}` : tipChoice ? ` · ${tipChoice}%` : ' · none';
 
   // goOverride: the group order just joined from the safety-net prompt
   // (the context update hasn't re-rendered yet).
@@ -9177,6 +9312,7 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
       showInfo('Gift Card', 'Please enter both the gift card number and its redemption code.');
       return;
     }
+    if (tipsOn && !tipChosen) { setTipOpen(true); return; } // tip first, then back to checkout
     if (!go && groupOffer && !groupOfferDeclined.current) { setGroupOfferOpen(true); return; }
     setPaying(true);
     try {
@@ -9190,6 +9326,10 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
           pickup_name: pickupName || undefined, client_request_id: clientRequestId.current,
           gift_card_number: giftCardNumber.trim() || undefined,
           gift_card_redeem_code: giftCardCode.trim() || undefined,
+          // A saved card is charged server-side right away; left out for a
+          // new card, which the pay sheet collects next.
+          stripe_pm_id: selectedTender !== 'new' ? selectedTender : undefined,
+          tip_cents: tipCents,
         },
       });
       if (!ok) { showInfo('Error', data?.detail || 'Could not place your order.'); return; }
@@ -9202,17 +9342,25 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
         afterPaid('Order Placed! ☕', 'Your order has been confirmed.', go);
         return;
       }
-      if (data.clover) {
-        const result = await payWithCard(data);
-        if (result.canceled) return;
-        if (!result.ok) { showInfo('Payment Error', result.error || 'Could not complete payment.'); return; }
-        // The cart may be cleared server-side a moment after the payment
-        // reports success -- check again shortly after.
+      // The cart may be cleared server-side a moment after the payment
+      // reports success -- check again shortly after.
+      const paid = () => {
         cart.refreshCounts();
         setTimeout(() => cart.refreshCounts(), 2500);
         setTimeout(() => cart.refreshCounts(), 6000);
         afterPaid('Order Placed! ☕', 'Payment received — your order is confirmed.', go);
+      };
+      if (data.clover) {
+        const result = await payWithCard(data);
+        if (result.canceled) return;
+        if (!result.ok) { showInfo('Payment Error', result.error || 'Could not complete payment.'); return; }
+        paid();
+        return;
       }
+      // Saved card charged (or, for a group order, authorized) server-side
+      // -- nothing left for the customer to do.
+      if (data.payment_status === 'succeeded' || data.payment_status === 'requires_capture') { paid(); return; }
+      showInfo('Payment Error', data.detail || 'Could not start your payment. Please try again.');
     } catch { showInfo('Error', 'Could not reach Dasta server.'); }
     finally { setPaying(false); }
   };
@@ -9287,10 +9435,46 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
           </Pressable>
         )}
 
+        {/* Pay with -- shown whenever free drinks and Dasta Cash leave
+            something to pay, same rule as web's "Charge remainder to". */}
+        {cardAmountCents > 0 && (
+          <View style={{ marginTop: 16 }}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+              <Text style={[S.fieldLabel, { marginBottom: 0 }]}>Pay with</Text>
+              <Pressable onPress={openAddCard} disabled={paying} hitSlop={8}>
+                <Text style={[S.linkText, { marginTop: 0 }]}>+ Add a card</Text>
+              </Pressable>
+            </View>
+            <View style={{ backgroundColor: C.white, borderRadius: 10, overflow: 'hidden' }}>
+              {[...(summary.saved_cards || []).map(c => ({ value: c.stripe_pm_id, label: c.display })),
+                { value: 'new', label: 'Use a new card' }].map((t, i) => {
+                const on = selectedTender === t.value;
+                return (
+                  <Pressable key={t.value} disabled={paying} onPress={() => setSelectedTender(t.value)}
+                    accessibilityRole="radio" accessibilityState={{ checked: on }}
+                    style={[S.profileMenuRow, { gap: 10 }, i > 0 && { borderTopWidth: 1, borderTopColor: C.border }]}>
+                    <Ionicons name={on ? 'radio-button-on' : 'radio-button-off'} size={20} color={on ? C.saffron : C.muted} />
+                    <Text style={[S.profileMenuRowText, { flex: 1 }]}>{t.label}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+          </View>
+        )}
+
         <View style={{ marginTop: 20, gap: 6 }}>
           <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={S.cardSub}>Subtotal</Text><Text style={S.cardSub}>${(summary.subtotal_cents / 100).toFixed(2)}</Text></View>
           <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={S.cardSub}>Tax</Text><Text style={S.cardSub}>${((taxCents || 0) / 100).toFixed(2)}</Text></View>
-          <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 4 }}><Text style={S.secTitle}>Total</Text><Text style={S.secTitle}>${((totalCents || 0) / 100).toFixed(2)}</Text></View>
+          {tipsOn && (
+            <>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={S.cardSub}>Order total</Text><Text style={S.cardSub}>${((totalCents || 0) / 100).toFixed(2)}</Text></View>
+              <Pressable onPress={() => setTipOpen(true)} disabled={paying} style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                <Text style={S.cardSub}>Tip{tipLabel} <Text style={{ color: C.saffron, fontWeight: '600' }}>{tipChosen ? 'Change' : 'Add'} ›</Text></Text>
+                <Text style={S.cardSub}>${(tipCents / 100).toFixed(2)}</Text>
+              </Pressable>
+            </>
+          )}
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 4 }}><Text style={S.secTitle}>Total</Text><Text style={S.secTitle}>${(orderTotalCents / 100).toFixed(2)}</Text></View>
         </View>
 
         {groupOrder ? (
@@ -9341,7 +9525,7 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
 
         <Pressable style={[S.btnSaffron, { marginTop: 20 }]} disabled={paying} onPress={() => handlePay()}>
           {paying ? <ActivityIndicator color={C.ivory} /> : (
-            <Text style={S.btnSaffronText}>{(totalCents || 0) === 0 ? '✅ Place Order' : `💳 Pay $${((totalCents || 0) / 100).toFixed(2)}`}</Text>
+            <Text style={S.btnSaffronText}>{orderTotalCents === 0 ? '✅ Place Order' : `💳 Pay $${(orderTotalCents / 100).toFixed(2)}`}</Text>
           )}
         </Pressable>
       </View>
@@ -9353,6 +9537,24 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
       message={infoModal?.message}
       buttonLabel={infoModal?.buttonLabel}
       onClose={() => { const cb = infoModal?.onOk; setInfoModal(null); cb?.(); }}
+    />
+    {tipOpen && (
+      <CheckoutTipModal
+        subtotalCents={summary.subtotal_cents || 0}
+        orderCents={totalCents || 0}
+        initial={{ choice: tipChoice, customPct: tipCustomPct, customCents: tipCustomCents }}
+        onBack={() => setTipOpen(false)}
+        onContinue={({ choice, customPct, customCents }) => {
+          setTipChoice(choice); setTipCustomPct(customPct); setTipCustomCents(customCents);
+          setTipChosen(true); setTipOpen(false);
+        }}
+      />
+    )}
+    <AddCardModal
+      visible={addCardOpen}
+      onClose={() => setAddCardOpen(false)}
+      identifier={addCardIdentifier}
+      onCardSaved={refreshAfterCardAdded}
     />
     {/* Group-order safety net. Not ConfirmModal: its backdrop tap and
         Cancel are the same callback, and here a stray tap must place
