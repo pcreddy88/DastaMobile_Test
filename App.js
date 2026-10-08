@@ -9027,6 +9027,67 @@ function CartScreen({ navigation, route }) {
 // Checkout tip buttons (Clover, 2026-10-08): percent of the pre-tax order
 // total after free drinks.
 const CHECKOUT_TIP_PCTS = [10, 15, 20];
+// Custom tip dials: % in whole steps up to 50%; $ in $0.25 steps up to 50%
+// of the base. The two are linked; the $ value is what's sent.
+const TIP_DIAL_MAX_PCT = 50;
+const TIP_DIAL_USD_STEP = 25; // cents
+const TIP_DIAL_DRAG_PX = 12;  // drag distance per step
+const tipDialMaxCents = (base) => Math.floor(base * TIP_DIAL_MAX_PCT / 100);
+// % dial: from a fractional % (set by the $ dial) the first step lands on
+// the next whole percent in that direction.
+function stepTipPct(t, dir, base) {
+  const pct = Math.max(0, Math.min(TIP_DIAL_MAX_PCT, dir > 0 ? Math.floor(t.pct) + 1 : Math.ceil(t.pct) - 1));
+  return { pct, cents: Math.min(tipDialMaxCents(base), Math.round(base * pct / 100)) };
+}
+// $ dial: off-step amounts (set by the % dial) snap to the nearest $0.25
+// in the direction turned.
+function stepTipCents(t, dir, base) {
+  const max = tipDialMaxCents(base);
+  const next = dir > 0
+    ? Math.floor(t.cents / TIP_DIAL_USD_STEP) * TIP_DIAL_USD_STEP + TIP_DIAL_USD_STEP
+    : Math.ceil(t.cents / TIP_DIAL_USD_STEP) * TIP_DIAL_USD_STEP - TIP_DIAL_USD_STEP;
+  const cents = Math.max(0, Math.min(max, next));
+  return { cents, pct: base ? cents / base * 100 : 0 };
+}
+
+// One vertical dial: big value, ▲ above, ▼ below. Tap an arrow for one
+// step, or drag up/down (one step per TIP_DIAL_DRAG_PX). onDragging lets
+// the screen stop its ScrollView from stealing the drag.
+function TipDial({ value, canUp, canDown, onStep, onDragging, disabled, accessibilityLabel }) {
+  const latest = useRef({});
+  latest.current = { onStep, onDragging, disabled };
+  const anchor = useRef(0);
+  const responder = useRef(PanResponder.create({
+    onStartShouldSetPanResponder: () => !latest.current.disabled,
+    onMoveShouldSetPanResponder: () => !latest.current.disabled,
+    onPanResponderTerminationRequest: () => false,
+    onPanResponderGrant: () => { anchor.current = 0; latest.current.onDragging?.(true); },
+    onPanResponderMove: (_e, g) => {
+      let d = anchor.current - g.dy; // upward drag is positive
+      while (d >= TIP_DIAL_DRAG_PX) { latest.current.onStep(1); anchor.current -= TIP_DIAL_DRAG_PX; d -= TIP_DIAL_DRAG_PX; }
+      while (d <= -TIP_DIAL_DRAG_PX) { latest.current.onStep(-1); anchor.current += TIP_DIAL_DRAG_PX; d += TIP_DIAL_DRAG_PX; }
+    },
+    onPanResponderRelease: () => latest.current.onDragging?.(false),
+    onPanResponderTerminate: () => latest.current.onDragging?.(false),
+  })).current;
+  const arrow = (dir, enabled) => (
+    <Pressable onPress={() => onStep(dir)} disabled={disabled || !enabled} hitSlop={6}
+      accessibilityLabel={`${dir > 0 ? 'Increase' : 'Decrease'} ${accessibilityLabel}`}
+      style={{ height: 36, alignSelf: 'stretch', alignItems: 'center', justifyContent: 'center', opacity: enabled ? 1 : 0.3 }}>
+      <Text style={{ color: C.saffron, fontSize: 18 }}>{dir > 0 ? '▲' : '▼'}</Text>
+    </Pressable>
+  );
+  return (
+    <View {...responder.panHandlers} accessibilityRole="adjustable" accessibilityLabel={accessibilityLabel} accessibilityValue={{ text: value }}
+      accessibilityActions={[{ name: 'increment' }, { name: 'decrement' }]}
+      onAccessibilityAction={(e) => onStep(e.nativeEvent.actionName === 'increment' ? 1 : -1)}
+      style={{ flex: 1, height: 132, borderRadius: 12, borderWidth: 1.5, borderColor: C.border, backgroundColor: C.white, alignItems: 'center', justifyContent: 'space-between', paddingVertical: 4 }}>
+      {arrow(1, canUp)}
+      <Text style={{ color: C.charcoal, fontSize: 28, fontWeight: '700' }} numberOfLines={1} adjustsFontSizeToFit>{value}</Text>
+      {arrow(-1, canDown)}
+    </View>
+  );
+}
 // "VISA" / "visa" -> "Visa" for the collapsed new-card row.
 const CARD_BRAND_LABELS = { visa: 'Visa', mastercard: 'Mastercard', mc: 'Mastercard', amex: 'Amex', american_express: 'Amex', americanexpress: 'Amex', discover: 'Discover' };
 function cardBrandLabel(brand) {
@@ -9087,11 +9148,18 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
   const [payError, setPayError] = useState('');
   const [payLocked, setPayLocked] = useState(false); // 409: an earlier Pay is still being charged
   // Tip (inline, Clover 2026-10-08): 0 (No tip) | 10 | 15 | 20 | 'custom'.
-  // Custom keeps both inputs' text; the last-edited one sets the amount.
+  // Custom is two linked dials, {pct, cents}; cents is what's sent.
   const [tipChoice, setTipChoice] = useState(10);
-  const [tipUsdText, setTipUsdText] = useState('');
-  const [tipPctText, setTipPctText] = useState('');
-  const [tipLastEdited, setTipLastEdited] = useState('usd'); // 'usd' | 'pct'
+  const [customTip, setCustomTip] = useState({ pct: 10, cents: 0 });
+  const [dialDragging, setDialDragging] = useState(false);
+  // Gift card fields kept above the keyboard (see focusGiftField).
+  const scrollRef = useRef(null);
+  const scrollY = useRef(0);
+  const contentY = useRef(0);   // padded content View's y in the ScrollView
+  const giftBlockY = useRef(0); // gift card block's y in that View
+  const giftBlockRef = useRef(null);
+  const giftCodeRef = useRef(null);
+  const giftFocused = useRef(false);
   // My Circles group order (2026-09-27) -- when set, pickup is the group's
   // shared time (no ASAP/schedule choice) and group_order_id rides along
   // with /checkout/confirm, which re-checks the join cutoff server-side.
@@ -9241,28 +9309,50 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
   const tipsOn = !!summary?.tips_enabled;
   const tipBaseCents = Math.max(0, (summary?.subtotal_cents || 0) - (voucherPreview?.discount_cents || 0));
   const tipFor = (pct) => Math.round(tipBaseCents * pct / 100);
-  const parseTipNum = (t) => { const v = parseFloat(t); return isFinite(v) && v > 0 ? v : 0; };
-  const tipCents = !tipsOn ? 0
-    : tipChoice !== 'custom' ? tipFor(tipChoice)
-    : tipLastEdited === 'pct' ? tipFor(parseTipNum(tipPctText))
-    : Math.round(parseTipNum(tipUsdText) * 100);
+  const tipCents = !tipsOn ? 0 : tipChoice !== 'custom' ? tipFor(tipChoice) : customTip.cents;
   const tipTooBig = tipCents > tipBaseCents;
   const orderTotalCents = (totalCents || 0) + tipCents;
   const walletApplied = useWallet && summary?.wallet && orderTotalCents > 0
     ? Math.min(summary.wallet.total_cents || 0, orderTotalCents) : 0;
   const cardAmountCents = orderTotalCents - walletApplied;
   const fmt = (cents) => `$${((cents || 0) / 100).toFixed(2)}`;
-  // Custom inputs fill each other: % -> $ to the cent, $ -> % to one decimal.
-  const onTipPct = (t) => {
-    setTipPctText(t); setTipLastEdited('pct');
-    const v = parseTipNum(t);
-    setTipUsdText(v ? (tipFor(v) / 100).toFixed(2) : '');
+  // Custom dials always open at 10%. If free drinks change the base, keep
+  // the % and recompute the $ (within the 50% limit).
+  const tipBaseRef = useRef(tipBaseCents);
+  tipBaseRef.current = tipBaseCents;
+  const chooseTip = (val) => {
+    if (val === 'custom' && tipChoice !== 'custom') setCustomTip({ pct: 10, cents: tipFor(10) });
+    setTipChoice(val); setPayError('');
   };
-  const onTipUsd = (t) => {
-    setTipUsdText(t); setTipLastEdited('usd');
-    const v = parseTipNum(t);
-    setTipPctText(v && tipBaseCents ? (Math.round(v * 100) / tipBaseCents * 100).toFixed(1) : '');
+  useEffect(() => {
+    setCustomTip(t => {
+      const cents = Math.min(tipDialMaxCents(tipBaseCents), Math.round(tipBaseCents * t.pct / 100));
+      return cents === t.cents ? t : { ...t, cents };
+    });
+  }, [tipBaseCents]);
+  const stepPctDial = (dir) => setCustomTip(t => stepTipPct(t, dir, tipBaseRef.current));
+  const stepUsdDial = (dir) => setCustomTip(t => stepTipCents(t, dir, tipBaseRef.current));
+  const pctLabel = Number.isInteger(customTip.pct) ? `${customTip.pct}%` : `${customTip.pct.toFixed(1)}%`;
+
+  // Gift card fields: scroll the whole block (both fields) above the
+  // keyboard on focus, then once more if the real keyboard still covers it.
+  const focusGiftField = () => {
+    giftFocused.current = true;
+    setTimeout(() => {
+      scrollRef.current?.scrollTo({ y: Math.max(0, contentY.current + giftBlockY.current - 24), animated: true });
+    }, 250);
   };
+  useEffect(() => {
+    const sub = Keyboard.addListener('keyboardDidShow', (e) => {
+      if (!giftFocused.current || !giftBlockRef.current) return;
+      const kbTop = e.endCoordinates.screenY;
+      giftBlockRef.current.measureInWindow((_x, y, _w, h) => {
+        const overlap = y + h + 16 - kbTop;
+        if (overlap > 0) scrollRef.current?.scrollTo({ y: scrollY.current + overlap, animated: true });
+      });
+    });
+    return () => sub.remove();
+  }, []);
 
   // "Use this card": tokenize the inline fields and collapse them.
   const tokenizeNewCard = async () => {
@@ -9382,8 +9472,14 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
 
   return (
     <>
-    <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-    <ScrollView style={S.screen} pinchGestureEnabled maximumZoomScale={3} minimumZoomScale={1} bouncesZoom keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag" contentContainerStyle={{ paddingBottom: 60 }}>
+    {/* iOS: the ScrollView insets itself for the keyboard
+        (automaticallyAdjustKeyboardInsets), so no KeyboardAvoidingView
+        padding on top of it. Android: 'height' with app.json's
+        softwareKeyboardLayoutMode "resize". */}
+    <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? undefined : 'height'}>
+    <ScrollView ref={scrollRef} style={S.screen} pinchGestureEnabled maximumZoomScale={3} minimumZoomScale={1} bouncesZoom keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag" contentContainerStyle={{ paddingBottom: 60 }}
+      automaticallyAdjustKeyboardInsets scrollEnabled={!dialDragging}
+      onScroll={(e) => { scrollY.current = e.nativeEvent.contentOffset.y; }} scrollEventThrottle={16}>
       <StatusBar style="light" />
       {/* Back-chevron removed (2026-09-23, PC's ask, app-wide audit) --
           Home tab is enough everywhere, arrow or not. */}
@@ -9391,7 +9487,7 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
         <HeroTitleRow title="Checkout" onBack={onHeaderBack} />
       </View>
 
-      <View style={{ padding: 16 }}>
+      <View style={{ padding: 16 }} onLayout={(e) => { contentY.current = e.nativeEvent.layout.y; }}>
         <GroupOrderBanner onCancel={leaveGroupCheckout} />
         {/* Order Items (2026-09-19, PC's live report) -- checkout used to
             jump straight to Subtotal/Tax/Total with no line items at all.
@@ -9504,37 +9600,34 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
         )}
 
         {/* Add a tip -- inline (no popup). Percent of the pre-tax order
-            total after free drinks; exactly one choice, 10% to start. */}
+            total after free drinks; exactly one choice, 10% to start. One
+            row of five compact buttons (fits a 360dp-wide phone). */}
         {tipsOn && (
           <View style={{ marginTop: 16 }}>
             <Text style={S.fieldLabel}>Add a tip</Text>
-            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+            <View style={{ flexDirection: 'row', gap: 6 }}>
               {[{ val: 0, label: 'No tip' },
-                ...CHECKOUT_TIP_PCTS.map(p => ({ val: p, label: `${p}% · ${fmt(tipFor(p))}` })),
+                ...CHECKOUT_TIP_PCTS.map(p => ({ val: p, label: `${p}%` })),
                 { val: 'custom', label: 'Custom' }].map(o => {
                 const on = tipChoice === o.val;
                 return (
-                  <Pressable key={String(o.val)} disabled={paying} onPress={() => { setTipChoice(o.val); setPayError(''); }}
+                  <Pressable key={String(o.val)} disabled={paying} onPress={() => chooseTip(o.val)}
                     accessibilityRole="radio" accessibilityState={{ checked: on }}
-                    style={{ flexBasis: '47%', flexGrow: 1, minHeight: 52, borderRadius: 12, alignItems: 'center', justifyContent: 'center',
-                      paddingHorizontal: 8, borderWidth: 1.5, borderColor: on ? C.saffron : C.border, backgroundColor: on ? C.saffron : C.white }}>
-                    <Text style={{ color: on ? C.white : C.charcoal, fontSize: 15, fontWeight: '700' }}>{o.label}</Text>
+                    style={{ flex: 1, height: 44, borderRadius: 10, alignItems: 'center', justifyContent: 'center',
+                      paddingHorizontal: 2, borderWidth: 1.5, borderColor: on ? C.saffron : C.border, backgroundColor: on ? C.saffron : C.white }}>
+                    <Text style={{ color: on ? C.white : C.charcoal, fontSize: 13, fontWeight: '700' }} numberOfLines={1} adjustsFontSizeToFit>{o.label}</Text>
                   </Pressable>
                 );
               })}
             </View>
             {tipChoice === 'custom' && (
-              <View style={{ flexDirection: 'row', gap: 8, marginTop: 10 }}>
-                <View style={[S.input, { flex: 1, flexDirection: 'row', alignItems: 'center', marginBottom: 0 }]}>
-                  <Text style={{ color: C.charcoal, fontSize: 15, marginRight: 4 }}>$</Text>
-                  <TextInput style={{ flex: 1, padding: 0, color: C.charcoal, fontSize: 15 }} value={tipUsdText} onChangeText={onTipUsd}
-                    placeholder="0.00" placeholderTextColor={C.muted} keyboardType="decimal-pad" editable={!paying} />
-                </View>
-                <View style={[S.input, { flex: 1, flexDirection: 'row', alignItems: 'center', marginBottom: 0 }]}>
-                  <TextInput style={{ flex: 1, padding: 0, color: C.charcoal, fontSize: 15 }} value={tipPctText} onChangeText={onTipPct}
-                    placeholder="0" placeholderTextColor={C.muted} keyboardType="decimal-pad" editable={!paying} />
-                  <Text style={{ color: C.charcoal, fontSize: 15, marginLeft: 4 }}>%</Text>
-                </View>
+              <View style={{ flexDirection: 'row', gap: 10, marginTop: 10, alignItems: 'stretch' }}>
+                <TipDial value={pctLabel} accessibilityLabel="tip percent" disabled={paying}
+                  canUp={customTip.pct < TIP_DIAL_MAX_PCT} canDown={customTip.pct > 0}
+                  onStep={stepPctDial} onDragging={setDialDragging} />
+                <TipDial value={fmt(customTip.cents)} accessibilityLabel="tip amount" disabled={paying}
+                  canUp={customTip.cents < tipDialMaxCents(tipBaseCents)} canDown={customTip.cents > 0}
+                  onStep={stepUsdDial} onDragging={setDialDragging} />
               </View>
             )}
             {tipTooBig && <Text style={{ color: '#C0392B', marginTop: 8 }}>That tip is more than the order itself.</Text>}
@@ -9553,11 +9646,12 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
             disabled={summary.is_open_now === false}
             style={[S.pickupPill, pickupType === 'asap' && S.pickupPillActive, summary.is_open_now === false && S.pickupPillDisabled]}
             onPress={() => setPickupType('asap')}>
-            <Text style={[S.pickupPillText, pickupType === 'asap' && S.pickupPillTextActive]}>ASAP</Text>
-            {summary.is_open_now !== false && <Text style={[S.pickupPillSub, pickupType === 'asap' && S.pickupPillTextActive]}>Ready in 10 min</Text>}
+            <Text style={[S.pickupPillText, pickupType === 'asap' && S.pickupPillTextActive]} numberOfLines={1} adjustsFontSizeToFit>
+              {summary.is_open_now !== false ? 'ASAP · in 10 min' : 'ASAP'}
+            </Text>
           </Pressable>
           <Pressable style={[S.pickupPill, pickupType === 'scheduled' && S.pickupPillActive]} onPress={() => setPickupType('scheduled')}>
-            <Text style={[S.pickupPillText, pickupType === 'scheduled' && S.pickupPillTextActive]}>Schedule for later</Text>
+            <Text style={[S.pickupPillText, pickupType === 'scheduled' && S.pickupPillTextActive]} numberOfLines={1} adjustsFontSizeToFit>Schedule for later</Text>
           </Pressable>
         </View>
         {summary.is_open_now === false && (
@@ -9579,11 +9673,16 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
           <Text style={S.linkText}>{giftCardOpen ? '▲' : '▼'} Have a gift card?</Text>
         </Pressable>
         {giftCardOpen && (
-          <View style={{ marginTop: 8 }}>
+          <View ref={giftBlockRef} collapsable={false} style={{ marginTop: 8 }}
+            onLayout={(e) => { giftBlockY.current = e.nativeEvent.layout.y; }}>
             <TextInput style={S.input} value={giftCardNumber} onChangeText={setGiftCardNumber}
-              placeholder="Gift card number" placeholderTextColor={C.muted} autoCapitalize="none" />
-            <TextInput style={S.input} value={giftCardCode} onChangeText={setGiftCardCode}
-              placeholder="Redemption code" placeholderTextColor={C.muted} autoCapitalize="characters" />
+              placeholder="Gift card number" placeholderTextColor={C.muted} autoCapitalize="none"
+              returnKeyType="next" blurOnSubmit={false} onSubmitEditing={() => giftCodeRef.current?.focus()}
+              onFocus={focusGiftField} onBlur={() => { giftFocused.current = false; }} />
+            <TextInput ref={giftCodeRef} style={S.input} value={giftCardCode} onChangeText={setGiftCardCode}
+              placeholder="Redemption code" placeholderTextColor={C.muted} autoCapitalize="characters"
+              returnKeyType="done" onSubmitEditing={() => Keyboard.dismiss()}
+              onFocus={focusGiftField} onBlur={() => { giftFocused.current = false; }} />
           </View>
         )}
 
