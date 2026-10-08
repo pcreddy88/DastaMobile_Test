@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "356213716009",
+    "project_id": "dasta-sipsense",
+    "storage_bucket": "dasta-sipsense.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:356213716009:android:9e2376055c6a787beed838",
+        "android_client_info": {
+          "package_name": "com.dasta.sipsense"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBk3nwWGJYoIroLLk5p0hpDwPM5zoVsVO8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
