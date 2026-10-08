@@ -7,6 +7,9 @@
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
+    "updates": {
+      "url": "https://u.expo.dev/5c98710b-bc4a-43ae-b965-c195c0e722b6"
+    },
     "runtimeVersion": {
       "policy": "appVersion"
     },
