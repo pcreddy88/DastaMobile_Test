@@ -110,6 +110,12 @@
           "speechRecognitionPermission": "Used to turn your spoken drink order into text instantly."
         }
       ]
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "5c98710b-bc4a-43ae-b965-c195c0e722b6"
+      }
+    },
+    "owner": "dastacafe"
   }
 }
