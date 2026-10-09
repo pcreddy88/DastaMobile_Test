@@ -9027,33 +9027,34 @@ function CartScreen({ navigation, route }) {
 // Checkout tip buttons (Clover, 2026-10-08): percent of the pre-tax order
 // total after free drinks.
 const CHECKOUT_TIP_PCTS = [10, 15, 20];
-// Custom tip dials: % in whole steps up to 50%; $ in $0.25 steps up to 50%
-// of the base. The two are linked; the $ value is what's sent.
-const TIP_DIAL_MAX_PCT = 50;
-const TIP_DIAL_USD_STEP = 25; // cents
-const TIP_DIAL_DRAG_PX = 12;  // drag distance per step
-const tipDialMaxCents = (base) => Math.floor(base * TIP_DIAL_MAX_PCT / 100);
-// % dial: from a fractional % (set by the $ dial) the first step lands on
+// Custom tip picker: two linked wheels, $ in $0.25 steps and % in 1%
+// steps, from 0 with no upper limit. The $ value is what's sent.
+const TIP_WHEEL_USD_STEP = 25; // cents
+const TIP_WHEEL_DRAG_PX = 20;  // swipe distance per step
+const CHECKOUT_COMPACT_H = 72; // free drink / Dasta Card boxes and the tip picker
+// % wheel: from a fractional % (set by the $ wheel) the first step lands on
 // the next whole percent in that direction.
 function stepTipPct(t, dir, base) {
-  const pct = Math.max(0, Math.min(TIP_DIAL_MAX_PCT, dir > 0 ? Math.floor(t.pct) + 1 : Math.ceil(t.pct) - 1));
-  return { pct, cents: Math.min(tipDialMaxCents(base), Math.round(base * pct / 100)) };
+  const pct = Math.max(0, dir > 0 ? Math.floor(t.pct) + 1 : Math.ceil(t.pct) - 1);
+  return { pct, cents: Math.round(base * pct / 100) };
 }
-// $ dial: off-step amounts (set by the % dial) snap to the nearest $0.25
+// $ wheel: off-step amounts (set by the % wheel) snap to the nearest $0.25
 // in the direction turned.
 function stepTipCents(t, dir, base) {
-  const max = tipDialMaxCents(base);
   const next = dir > 0
-    ? Math.floor(t.cents / TIP_DIAL_USD_STEP) * TIP_DIAL_USD_STEP + TIP_DIAL_USD_STEP
-    : Math.ceil(t.cents / TIP_DIAL_USD_STEP) * TIP_DIAL_USD_STEP - TIP_DIAL_USD_STEP;
-  const cents = Math.max(0, Math.min(max, next));
+    ? Math.floor(t.cents / TIP_WHEEL_USD_STEP) * TIP_WHEEL_USD_STEP + TIP_WHEEL_USD_STEP
+    : Math.ceil(t.cents / TIP_WHEEL_USD_STEP) * TIP_WHEEL_USD_STEP - TIP_WHEEL_USD_STEP;
+  const cents = Math.max(0, next);
   return { cents, pct: base ? cents / base * 100 : 0 };
 }
+const tipPctLabel = (pct) => (Number.isInteger(pct) ? `${pct}%` : `${pct.toFixed(1)}%`);
 
-// One vertical dial: big value, ▲ above, ▼ below. Tap an arrow for one
-// step, or drag up/down (one step per TIP_DIAL_DRAG_PX). onDragging lets
-// the screen stop its ScrollView from stealing the drag.
-function TipDial({ value, canUp, canDown, onStep, onDragging, disabled, accessibilityLabel }) {
+// One wheel of the tip picker, iOS time-picker style: a small grey value
+// above (one step down), the selected value in the middle, a small grey
+// value below (one step up). Swipe up/down to turn it a step at a time,
+// or tap the value above/below. onDragging lets the screen stop its
+// ScrollView from stealing the swipe.
+function TipWheel({ above, value, below, onStep, onDragging, disabled, accessibilityLabel }) {
   const latest = useRef({});
   latest.current = { onStep, onDragging, disabled };
   const anchor = useRef(0);
@@ -9063,31 +9064,33 @@ function TipDial({ value, canUp, canDown, onStep, onDragging, disabled, accessib
     onPanResponderTerminationRequest: () => false,
     onPanResponderGrant: () => { anchor.current = 0; latest.current.onDragging?.(true); },
     onPanResponderMove: (_e, g) => {
-      let d = anchor.current - g.dy; // upward drag is positive
-      while (d >= TIP_DIAL_DRAG_PX) { latest.current.onStep(1); anchor.current -= TIP_DIAL_DRAG_PX; d -= TIP_DIAL_DRAG_PX; }
-      while (d <= -TIP_DIAL_DRAG_PX) { latest.current.onStep(-1); anchor.current += TIP_DIAL_DRAG_PX; d += TIP_DIAL_DRAG_PX; }
+      let d = anchor.current - g.dy; // swipe up = larger values
+      while (d >= TIP_WHEEL_DRAG_PX) { latest.current.onStep(1); anchor.current -= TIP_WHEEL_DRAG_PX; d -= TIP_WHEEL_DRAG_PX; }
+      while (d <= -TIP_WHEEL_DRAG_PX) { latest.current.onStep(-1); anchor.current += TIP_WHEEL_DRAG_PX; d += TIP_WHEEL_DRAG_PX; }
     },
     onPanResponderRelease: () => latest.current.onDragging?.(false),
     onPanResponderTerminate: () => latest.current.onDragging?.(false),
   })).current;
-  const arrow = (dir, enabled) => (
-    <Pressable onPress={() => onStep(dir)} disabled={disabled || !enabled} hitSlop={6}
-      accessibilityLabel={`${dir > 0 ? 'Increase' : 'Decrease'} ${accessibilityLabel}`}
-      style={{ height: 36, alignSelf: 'stretch', alignItems: 'center', justifyContent: 'center', opacity: enabled ? 1 : 0.3 }}>
-      <Text style={{ color: C.saffron, fontSize: 18 }}>{dir > 0 ? '▲' : '▼'}</Text>
+  const side = (dir, text) => (
+    <Pressable onPress={() => onStep(dir)} disabled={disabled || text == null} hitSlop={4}
+      style={{ height: 21, alignSelf: 'stretch', alignItems: 'center', justifyContent: 'center' }}>
+      <Text style={{ color: C.muted, fontSize: 11 }}>{text ?? ''}</Text>
     </Pressable>
   );
   return (
     <View {...responder.panHandlers} accessibilityRole="adjustable" accessibilityLabel={accessibilityLabel} accessibilityValue={{ text: value }}
       accessibilityActions={[{ name: 'increment' }, { name: 'decrement' }]}
       onAccessibilityAction={(e) => onStep(e.nativeEvent.actionName === 'increment' ? 1 : -1)}
-      style={{ flex: 1, height: 132, borderRadius: 12, borderWidth: 1.5, borderColor: C.border, backgroundColor: C.white, alignItems: 'center', justifyContent: 'space-between', paddingVertical: 4 }}>
-      {arrow(1, canUp)}
-      <Text style={{ color: C.charcoal, fontSize: 28, fontWeight: '700' }} numberOfLines={1} adjustsFontSizeToFit>{value}</Text>
-      {arrow(-1, canDown)}
+      style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
+      {side(-1, above)}
+      <View style={{ height: 28, justifyContent: 'center' }}>
+        <Text style={{ color: C.saffron, fontSize: 13, fontWeight: '700' }}>{value}</Text>
+      </View>
+      {side(1, below)}
     </View>
   );
 }
+
 // "VISA" / "visa" -> "Visa" for the collapsed new-card row.
 const CARD_BRAND_LABELS = { visa: 'Visa', mastercard: 'Mastercard', mc: 'Mastercard', amex: 'Amex', american_express: 'Amex', americanexpress: 'Amex', discover: 'Discover' };
 function cardBrandLabel(brand) {
@@ -9304,20 +9307,23 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
   const totalCents = voucherPreview?.total_cents ?? summary?.total_cents_no_voucher;
   const taxCents = voucherPreview?.tax_cents ?? summary?.tax_cents_no_voucher;
   // Tip + remainder, as web's yoComputeWaterfall: the tip is a percent of
-  // the pre-tax order total after free drinks, added on top of the order;
-  // Dasta Card then covers what it can and a card pays the rest.
+  // the pre-tax subtotal BEFORE free-drink discounts (items at full price),
+  // so a free drink still gets a tip; it's added on top of the order, then
+  // Dasta Card covers what it can and a card pays the rest.
   const tipsOn = !!summary?.tips_enabled;
-  const tipBaseCents = Math.max(0, (summary?.subtotal_cents || 0) - (voucherPreview?.discount_cents || 0));
+  const tipBaseCents = summary?.subtotal_cents || 0;
+  const freeDrinkCents = voucherCount > 0 ? (voucherPreview?.discount_cents || 0) : 0;
   const tipFor = (pct) => Math.round(tipBaseCents * pct / 100);
   const tipCents = !tipsOn ? 0 : tipChoice !== 'custom' ? tipFor(tipChoice) : customTip.cents;
-  const tipTooBig = tipCents > tipBaseCents;
+  const tipOverBase = tipCents > tipBaseCents; // a note only; Pay still works
+  const tipPctNow = tipChoice === 'custom' ? customTip.pct : tipChoice;
   const orderTotalCents = (totalCents || 0) + tipCents;
   const walletApplied = useWallet && summary?.wallet && orderTotalCents > 0
     ? Math.min(summary.wallet.total_cents || 0, orderTotalCents) : 0;
   const cardAmountCents = orderTotalCents - walletApplied;
   const fmt = (cents) => `$${((cents || 0) / 100).toFixed(2)}`;
-  // Custom dials always open at 10%. If free drinks change the base, keep
-  // the % and recompute the $ (within the 50% limit).
+  // The custom picker always opens at 10%. If the base changes, keep the %
+  // and recompute the $.
   const tipBaseRef = useRef(tipBaseCents);
   tipBaseRef.current = tipBaseCents;
   const chooseTip = (val) => {
@@ -9326,13 +9332,12 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
   };
   useEffect(() => {
     setCustomTip(t => {
-      const cents = Math.min(tipDialMaxCents(tipBaseCents), Math.round(tipBaseCents * t.pct / 100));
+      const cents = Math.round(tipBaseCents * t.pct / 100);
       return cents === t.cents ? t : { ...t, cents };
     });
   }, [tipBaseCents]);
-  const stepPctDial = (dir) => setCustomTip(t => stepTipPct(t, dir, tipBaseRef.current));
-  const stepUsdDial = (dir) => setCustomTip(t => stepTipCents(t, dir, tipBaseRef.current));
-  const pctLabel = Number.isInteger(customTip.pct) ? `${customTip.pct}%` : `${customTip.pct.toFixed(1)}%`;
+  const stepPctWheel = (dir) => setCustomTip(t => stepTipPct(t, dir, tipBaseRef.current));
+  const stepUsdWheel = (dir) => setCustomTip(t => stepTipCents(t, dir, tipBaseRef.current));
 
   // Gift card fields: scroll the whole block (both fields) above the
   // keyboard on focus, then once more if the real keyboard still covers it.
@@ -9379,7 +9384,6 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
       setPayError('Please enter both the gift card number and its redemption code.');
       return;
     }
-    if (tipTooBig) { setPayError('That tip is more than the order itself.'); return; }
     // A new card must be entered before Pay; if the fields are filled in
     // but "Use this card" wasn't tapped, tokenize them now.
     let card = selectedTender === 'new' ? newCard : null;
@@ -9523,23 +9527,36 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
           </>
         )}
 
-        {summary.available_vouchers > 0 && (
-          <View style={[S.rewardVoucherBox, { marginTop: 12 }]}>
-            <Text style={S.rewardVoucherText}>🏆 {summary.available_vouchers} Free Drink{summary.available_vouchers > 1 ? 's' : ''} available</Text>
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 14, marginTop: 8 }}>
-              <Pressable onPress={() => setVoucherCount(c => Math.max(0, c - 1))} style={S.qtyBtn}><Text style={S.qtyBtnText}>−</Text></Pressable>
-              <Text style={{ fontWeight: '700' }}>{voucherCount} applied</Text>
-              <Pressable onPress={() => setVoucherCount(c => Math.min(summary.max_vouchers_applicable || 0, c + 1))} style={S.qtyBtn}><Text style={S.qtyBtnText}>+</Text></Pressable>
-            </View>
+        {/* Free drinks and Dasta Card side by side, same compact height. */}
+        {(summary.available_vouchers > 0 || summary.wallet?.total_cents > 0) && (
+          <View style={{ flexDirection: 'row', gap: 10, marginTop: 12 }}>
+            {summary.available_vouchers > 0 && (() => {
+              const max = summary.max_vouchers_applicable || 0;
+              const canDown = voucherCount > 0, canUp = voucherCount < max;
+              return (
+                <View style={[S.checkoutHalfBox, { justifyContent: 'space-between' }]}>
+                  <Text style={S.checkoutHalfTitle} numberOfLines={1}>Free Drink(s)</Text>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+                    <Pressable onPress={() => setVoucherCount(c => Math.max(0, c - 1))} disabled={!canDown || paying}
+                      accessibilityLabel="One fewer free drink" style={[S.qtyBtn, !canDown && { opacity: 0.35 }]}><Text style={S.qtyBtnText}>−</Text></Pressable>
+                    <Text style={{ fontWeight: '700', color: C.charcoal, minWidth: 14, textAlign: 'center' }}>{voucherCount}</Text>
+                    <Pressable onPress={() => setVoucherCount(c => Math.min(max, c + 1))} disabled={!canUp || paying}
+                      accessibilityLabel="One more free drink" style={[S.qtyBtn, !canUp && { opacity: 0.35 }]}><Text style={S.qtyBtnText}>+</Text></Pressable>
+                  </View>
+                </View>
+              );
+            })()}
+            {summary.wallet?.total_cents > 0 && (
+              <Pressable style={[S.checkoutHalfBox, { justifyContent: 'space-between' }]} onPress={() => setUseWallet(v => !v)} disabled={paying}
+                accessibilityRole="switch" accessibilityState={{ checked: useWallet }}>
+                <Text style={S.checkoutHalfTitle} numberOfLines={1}>Use Dasta Card</Text>
+                <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <Text style={{ color: C.black, fontSize: 13 }}>{fmt(summary.wallet.total_cents)}</Text>
+                  <Switch value={useWallet} onValueChange={setUseWallet} disabled={paying} trackColor={{ false: C.border, true: C.saffron }} thumbColor={C.white} />
+                </View>
+              </Pressable>
+            )}
           </View>
-        )}
-
-        {summary.wallet?.total_cents > 0 && (
-          <Pressable style={[S.profileMenuRow, { justifyContent: 'space-between', backgroundColor: C.white, borderRadius: 10, marginTop: 12 }]}
-            onPress={() => setUseWallet(v => !v)}>
-            <Text style={S.profileMenuRowText}>Use Dasta Card ({fmt(summary.wallet.total_cents)})</Text>
-            <Switch value={useWallet} onValueChange={setUseWallet} trackColor={{ false: C.border, true: C.saffron }} thumbColor={C.white} />
-          </Pressable>
         )}
 
         {/* Pay with -- shown whenever free drinks and Dasta Card leave
@@ -9621,16 +9638,24 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
               })}
             </View>
             {tipChoice === 'custom' && (
-              <View style={{ flexDirection: 'row', gap: 10, marginTop: 10, alignItems: 'stretch' }}>
-                <TipDial value={pctLabel} accessibilityLabel="tip percent" disabled={paying}
-                  canUp={customTip.pct < TIP_DIAL_MAX_PCT} canDown={customTip.pct > 0}
-                  onStep={stepPctDial} onDragging={setDialDragging} />
-                <TipDial value={fmt(customTip.cents)} accessibilityLabel="tip amount" disabled={paying}
-                  canUp={customTip.cents < tipDialMaxCents(tipBaseCents)} canDown={customTip.cents > 0}
-                  onStep={stepUsdDial} onDragging={setDialDragging} />
+              <View style={{ height: CHECKOUT_COMPACT_H, marginTop: 10, flexDirection: 'row', borderRadius: 10, borderWidth: 1, borderColor: C.border, backgroundColor: C.white, overflow: 'hidden' }}>
+                {/* Selection band across the middle, behind both wheels. */}
+                <View pointerEvents="none" style={{ position: 'absolute', left: 6, right: 6, top: (CHECKOUT_COMPACT_H - 2 - 28) / 2, height: 28,
+                  borderRadius: 8, borderWidth: 1, borderColor: C.saffron, backgroundColor: '#FDEDE3', justifyContent: 'center' }}>
+                  <Text style={{ position: 'absolute', left: 10, color: C.saffron, fontSize: 13, fontWeight: '700' }}>$</Text>
+                  <Text style={{ position: 'absolute', right: 10, color: C.saffron, fontSize: 13, fontWeight: '700' }}>%</Text>
+                </View>
+                <TipWheel accessibilityLabel="tip amount" disabled={paying} onStep={stepUsdWheel} onDragging={setDialDragging}
+                  above={customTip.cents > 0 ? fmt(stepTipCents(customTip, -1, tipBaseCents).cents) : null}
+                  value={fmt(customTip.cents)}
+                  below={fmt(stepTipCents(customTip, 1, tipBaseCents).cents)} />
+                <TipWheel accessibilityLabel="tip percent" disabled={paying} onStep={stepPctWheel} onDragging={setDialDragging}
+                  above={customTip.pct > 0 ? tipPctLabel(stepTipPct(customTip, -1, tipBaseCents).pct) : null}
+                  value={tipPctLabel(customTip.pct)}
+                  below={tipPctLabel(stepTipPct(customTip, 1, tipBaseCents).pct)} />
               </View>
             )}
-            {tipTooBig && <Text style={{ color: '#C0392B', marginTop: 8 }}>That tip is more than the order itself.</Text>}
+            {tipOverBase && <Text style={{ color: C.saffron, fontSize: 12, marginTop: 6 }}>The tip is more than the order itself</Text>}
           </View>
         )}
 
@@ -9687,17 +9712,23 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
         )}
 
 
-        <View style={{ marginTop: 20, gap: 6 }}>
-          <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={S.cardSub}>Subtotal</Text><Text style={S.cardSub}>${(summary.subtotal_cents / 100).toFixed(2)}</Text></View>
-          <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={S.cardSub}>Tax</Text><Text style={S.cardSub}>${((taxCents || 0) / 100).toFixed(2)}</Text></View>
-          {tipsOn && (
-            <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={S.cardSub}>Tip</Text><Text style={S.cardSub}>{fmt(tipCents)}</Text></View>
+        <View style={{ marginTop: 20, gap: 2 }}>
+          <View style={S.checkoutTotalRow}><Text style={S.checkoutTotalText}>Subtotal</Text><Text style={S.checkoutTotalText}>{fmt(summary.subtotal_cents)}</Text></View>
+          {freeDrinkCents > 0 && (
+            <View style={S.checkoutTotalRow}>
+              <Text style={[S.checkoutTotalText, { color: '#2a8f4f' }]}>Free drink{voucherCount > 1 ? 's' : ''}</Text>
+              <Text style={[S.checkoutTotalText, { color: '#2a8f4f' }]}>−{fmt(freeDrinkCents)}</Text>
+            </View>
           )}
-          <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 4 }}><Text style={S.secTitle}>Total</Text><Text style={S.secTitle}>{fmt(orderTotalCents)}</Text></View>
+          <View style={S.checkoutTotalRow}><Text style={S.checkoutTotalText}>Tax</Text><Text style={S.checkoutTotalText}>{fmt(taxCents)}</Text></View>
+          {tipsOn && (
+            <View style={S.checkoutTotalRow}><Text style={S.checkoutTotalText}>Tip ({tipPctLabel(tipPctNow)})</Text><Text style={S.checkoutTotalText}>{fmt(tipCents)}</Text></View>
+          )}
+          <View style={[S.checkoutTotalRow, { marginTop: 2 }]}><Text style={[S.secTitle, { fontSize: 17 }]}>Total</Text><Text style={[S.secTitle, { fontSize: 17 }]}>{fmt(orderTotalCents)}</Text></View>
         </View>
 
         {!!payError && <Text style={{ color: '#C0392B', marginTop: 16, textAlign: 'center' }}>{payError}</Text>}
-        <Pressable style={[S.btnSaffron, { marginTop: 20 }, (payLocked || tipTooBig) && { opacity: 0.6 }]} disabled={paying || payLocked || tipTooBig} onPress={() => handlePay()}>
+        <Pressable style={[S.btnSaffron, { marginTop: 20 }, payLocked && { opacity: 0.6 }]} disabled={paying || payLocked} onPress={() => handlePay()}>
           {paying ? <ActivityIndicator color={C.ivory} /> : (
             <Text style={S.btnSaffronText}>{orderTotalCents === 0 ? '✅ Place Order' : `💳 Pay ${fmt(orderTotalCents)}`}</Text>
           )}
@@ -13290,6 +13321,10 @@ const S = StyleSheet.create({
   micHeardEcho:      { color: C.black, fontSize: 12, fontStyle: 'italic', marginTop: 4 },
   modifierRowText:  { color: C.charcoal, fontSize: 14 },
   modifierRowPrice: { color: C.black, fontSize: 13 },
+  checkoutHalfBox:   { flex: 1, height: CHECKOUT_COMPACT_H, borderRadius: 10, borderWidth: 1, borderColor: C.border, backgroundColor: C.white, paddingHorizontal: 10, paddingVertical: 8 },
+  checkoutHalfTitle: { color: C.charcoal, fontSize: 13, fontWeight: '700' },
+  checkoutTotalRow:  { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline' },
+  checkoutTotalText: { color: C.black, fontSize: 13 },
   qtyBtn:     { width: 32, height: 32, borderRadius: 16, backgroundColor: C.white, borderWidth: 1, borderColor: C.border, alignItems: 'center', justifyContent: 'center' },
   qtyBtnText: { fontSize: 18, fontWeight: '700', color: C.charcoal },
   // Today's Discovery (2026-09-13)
