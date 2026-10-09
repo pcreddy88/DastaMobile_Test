@@ -8781,6 +8781,32 @@ function PairingScreen({ route, navigation }) {
 const TEMP_MOD_LABELS  = { regular: 'Regular', extra_hot: 'Extra Hot', light_ice: 'Light Ice', extra_ice: 'Extra Ice' };
 const SWEET_MOD_LABELS = { unsweetened: 'Unsweetened', light: 'Light', regular: 'Regular', extra: 'Extra' };
 
+// ── Cart / checkout item lines (2026-10-09) ────────────────────
+// Line 1: "<qty> × " (only when > 1), the name, " · 16 oz", " · Hot/Iced".
+// Line 2: Dasta Menu add-ons ("Oat milk +$0.75", same as the website's
+// yoDastaMenuModifiersHTML) and any non-default temperature/sweetness.
+// Food lines show the name only.
+const ITEM_TEMP_MOD_LABELS = { extra_hot: 'Extra hot', light_ice: 'Light ice', extra_ice: 'Extra ice' };
+const ITEM_SWEET_MOD_LABELS = { unsweetened: 'Unsweetened', light: 'Less sweet', extra: 'Extra sweet' };
+const isFoodLine = (it) => !!it.is_food || it.item_type === 'food';
+function itemTitleLine(it) {
+  const qty = it.quantity > 1 ? `${it.quantity} × ` : '';
+  if (isFoodLine(it)) return `${qty}${it.drink_name}`;
+  return `${qty}${it.drink_name}${it.size_oz ? ` · ${it.size_oz} oz` : ''}`
+    + (it.served_temperature ? ` · ${it.served_temperature === 'iced' ? 'Iced' : 'Hot'}` : '');
+}
+// includeTempSweet: false where the Cart screen already shows those as pills.
+function itemDetailLine(it, { includeTempSweet = true } = {}) {
+  if (isFoodLine(it)) return '';
+  const parts = (it.selected_modifiers || []).map(m =>
+    `${m.name}${m.price_cents > 0 ? ` +$${(m.price_cents / 100).toFixed(2)}` : ''}`);
+  if (includeTempSweet) {
+    if (ITEM_TEMP_MOD_LABELS[it.temperature_modifier]) parts.push(ITEM_TEMP_MOD_LABELS[it.temperature_modifier]);
+    if (ITEM_SWEET_MOD_LABELS[it.sweetness_modifier]) parts.push(ITEM_SWEET_MOD_LABELS[it.sweetness_modifier]);
+  }
+  return parts.join(' · ');
+}
+
 function CartScreen({ navigation, route }) {
   const customer = route?.params?.customer || null;
   const cart = useCart();
@@ -8912,8 +8938,10 @@ function CartScreen({ navigation, route }) {
               <View key={it.id} style={[S.menuItemCard, { flexDirection: 'column', alignItems: 'stretch' }]}>
                 <View style={{ flexDirection: 'row' }}>
                   <View style={{ flex: 1 }}>
-                    <Text style={S.menuItemName}>{it.drink_name}</Text>
-                    {it.size_oz ? <Text style={S.menuItemDesc}>{it.size_oz}oz{it.served_temperature ? ` · ${it.served_temperature === 'iced' ? 'Iced' : 'Hot'}` : ''}</Text> : null}
+                    <Text style={[S.menuItemName, { flex: 0 }]}>{itemTitleLine(it)}</Text>
+                    {!!itemDetailLine(it, { includeTempSweet: isDastaMenu }) && (
+                      <Text style={S.itemDetailLine}>{itemDetailLine(it, { includeTempSweet: isDastaMenu })}</Text>
+                    )}
                     <Text style={S.menuItemPrice}>${(it.line_total_cents / 100).toFixed(2)}</Text>
                   </View>
                   <View style={{ alignItems: 'flex-end', gap: 10 }}>
@@ -8929,17 +8957,6 @@ function CartScreen({ navigation, route }) {
                     </Pressable>
                   </View>
                 </View>
-
-                {/* Dasta Menu selected modifiers — read-only tags, locked in at the popup */}
-                {isDastaMenu && it.selected_modifiers?.length > 0 && (
-                  <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
-                    {it.selected_modifiers.map((m, i) => (
-                      <View key={i} style={S.dastaMenuModTag}>
-                        <Text style={S.dastaMenuModTagText}>{m.name}{m.price_cents > 0 ? ` (+$${(m.price_cents / 100).toFixed(2)})` : ''}</Text>
-                      </View>
-                    ))}
-                  </View>
-                )}
 
                 {/* Size pills — real drinks only, matches yoItemSizeHTML's own gate */}
                 {isDrink && !isDastaMenu && (
@@ -9487,17 +9504,18 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
         {(summary.items || []).length > 0 && (
           <View style={{ marginBottom: 4 }}>
             <Text style={S.fieldLabel}>Order Items</Text>
-            {summary.items.map(it => (
-              <View key={it.id} style={{ flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 6 }}>
-                <View style={{ flex: 1, paddingRight: 10 }}>
-                  <Text style={S.menuItemName}>{it.quantity > 1 ? `${it.quantity}× ` : ''}{it.drink_name}</Text>
-                  {it.size_oz ? (
-                    <Text style={S.menuItemDesc}>{it.size_oz}oz{it.served_temperature ? ` · ${it.served_temperature === 'iced' ? 'Iced' : 'Hot'}` : ''}</Text>
-                  ) : null}
+            {summary.items.map(it => {
+              const detail = itemDetailLine(it);
+              return (
+                <View key={it.id} style={{ flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 6 }}>
+                  <View style={{ flex: 1, paddingRight: 10 }}>
+                    <Text style={[S.menuItemName, { flex: 0, marginRight: 0 }]}>{itemTitleLine(it)}</Text>
+                    {!!detail && <Text style={S.itemDetailLine}>{detail}</Text>}
+                  </View>
+                  <Text style={[S.menuItemPrice, { marginTop: 0 }]}>${(it.line_total_cents / 100).toFixed(2)}</Text>
                 </View>
-                <Text style={S.menuItemPrice}>${(it.line_total_cents / 100).toFixed(2)}</Text>
-              </View>
-            ))}
+              );
+            })}
           </View>
         )}
 
@@ -13538,6 +13556,7 @@ const S = StyleSheet.create({
   menuItemImage:         { width: 64, height: 64, borderRadius: 10, backgroundColor: C.ivory },
   menuItemName:          { color: C.charcoal, fontWeight: '700', fontSize: 14, flex: 1, marginRight: 6 },
   menuItemFeatured:      { color: C.gold, fontSize: 9, fontWeight: '700', letterSpacing: 0.5 },
+  itemDetailLine:        { color: 'rgba(0,0,0,0.7)', fontSize: 12.5, marginTop: 2, lineHeight: 17 },
   menuItemDesc:          { color: C.black, fontSize: 12, marginTop: 2, lineHeight: 16 },
   menuItemPrice:         { color: C.saffron, fontWeight: '700', fontSize: 13, marginTop: 6 },
   // Dedicated style (2026-09-15 fix, PC's live report) — this row used to
