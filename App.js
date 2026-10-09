@@ -9139,8 +9139,6 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
   // remainder to": a saved card's card_ref, or 'new' for a card entered
   // inline below.
   const [selectedTender, setSelectedTender] = useState('new');
-  const [addCardOpen, setAddCardOpen] = useState(false);
-  const [addCardIdentifier, setAddCardIdentifier] = useState(null);
   // Inline new card: CloverCardFields until "Use this card" tokenizes it,
   // then {token, card} (shown collapsed). cardFieldsKey remounts empty fields.
   const cardFieldsRef = useRef(null);
@@ -9270,28 +9268,6 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
     setLoading(false);
   };
   useEffect(() => { load(); }, []);
-
-  // "+ Add a card": AddCardModal's re-auth needs the customer's phone/email.
-  const openAddCard = async () => {
-    let id = customer?.phone || customer?.email || null;
-    if (!id) {
-      const { ok, data } = await apiFetch('/auth/me');
-      if (ok && data?.success) id = data.customer?.phone || data.customer?.email || null;
-    }
-    setAddCardIdentifier(id);
-    setAddCardOpen(true);
-  };
-  // Refresh only the summary (keeps free drinks, Dasta Card, pickup and
-  // gift card as the customer left them) and select the card just added.
-  const refreshAfterCardAdded = async () => {
-    const { ok, data } = await apiFetch('/checkout/summary');
-    if (!ok || !data?.success) return;
-    const before = new Set((summary?.saved_cards || []).map(cardRefOf));
-    const added = (data.saved_cards || []).find(c => !before.has(cardRefOf(c)));
-    const stillThere = selectedTender === 'new' || (data.saved_cards || []).some(c => cardRefOf(c) === selectedTender);
-    setSummary(data);
-    setSelectedTender(added ? cardRefOf(added) : stillThere ? selectedTender : defaultTender(data));
-  };
 
   // Pickup slots: "Fri 2:00 PM" on the button; in the drop-down, a day
   // header (Today / Tomorrow / "Sat Oct 11") over "2:00 PM" rows.
@@ -9567,7 +9543,7 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
                 <Text style={S.checkoutHalfTitle} numberOfLines={1}>Use Dasta Card</Text>
                 <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
                   <Text style={{ color: C.black, fontSize: 13 }}>{fmt(summary.wallet.total_cents)}</Text>
-                  <Switch value={useWallet} onValueChange={setUseWallet} disabled={paying} trackColor={{ false: C.border, true: C.saffron }} thumbColor={C.white} />
+                  <Switch value={useWallet} onValueChange={setUseWallet} disabled={paying} trackColor={{ false: C.muted, true: C.saffron }} ios_backgroundColor={C.muted} thumbColor={C.white} />
                 </View>
               </Pressable>
             )}
@@ -9578,12 +9554,7 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
             something to pay, same rule as web's "Charge remainder to". */}
         {cardAmountCents > 0 && (
           <View style={{ marginTop: 16 }}>
-            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-              <Text style={[S.fieldLabel, { marginBottom: 0 }]}>Pay with</Text>
-              <Pressable onPress={openAddCard} disabled={paying} hitSlop={8}>
-                <Text style={[S.linkText, { marginTop: 0 }]}>+ Add a card</Text>
-              </Pressable>
-            </View>
+            <Text style={S.fieldLabel}>Pay with</Text>
             <View style={{ backgroundColor: C.white, borderRadius: 10, overflow: 'hidden' }}>
               {[...(summary.saved_cards || []).map(c => ({ value: cardRefOf(c), label: c.display })),
                 { value: 'new', label: 'Use a new card' }].map((t, i) => {
@@ -9756,7 +9727,7 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
         {!!payError && <Text style={{ color: '#C0392B', marginTop: 16, textAlign: 'center' }}>{payError}</Text>}
         <Pressable style={[S.btnSaffron, { marginTop: 20 }, payLocked && { opacity: 0.6 }]} disabled={paying || payLocked} onPress={() => handlePay()}>
           {paying ? <ActivityIndicator color={C.ivory} /> : (
-            <Text style={S.btnSaffronText}>{orderTotalCents === 0 ? '✅ Place Order' : `💳 Pay ${fmt(orderTotalCents)}`}</Text>
+            <Text style={S.btnSaffronText}>{orderTotalCents === 0 ? '✅ Place Order' : `Pay ${fmt(orderTotalCents)}`}</Text>
           )}
         </Pressable>
       </View>
@@ -9768,12 +9739,6 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
       message={infoModal?.message}
       buttonLabel={infoModal?.buttonLabel}
       onClose={() => { const cb = infoModal?.onOk; setInfoModal(null); cb?.(); }}
-    />
-    <AddCardModal
-      visible={addCardOpen}
-      onClose={() => setAddCardOpen(false)}
-      identifier={addCardIdentifier}
-      onCardSaved={refreshAfterCardAdded}
     />
     {/* Group-order safety net. Not ConfirmModal: its backdrop tap and
         Cancel are the same callback, and here a stray tap must place
