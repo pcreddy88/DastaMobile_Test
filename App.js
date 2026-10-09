@@ -5358,7 +5358,10 @@ function MenuItemPanel({ item, onClose, cart, customer, navigation, showInfo }) 
     const { ok, data } = kind === 'order' ? await cart.addToCart(payload) : await cart.addToGift(payload);
     setAdding(null);
     if (ok && data?.success) {
-      showInfo(kind === 'order' ? 'Added to Cart 🛒' : 'Added to Gift 🎁', `${item.name} — ${quantity}x`, onClose);
+      // Added to the cart: no popup (the header's cart badge already shows
+      // it), just back to the menu.
+      if (kind === 'order') onClose();
+      else showInfo('Added to Gift 🎁', `${item.name} — ${quantity}x`, onClose);
     } else {
       showInfo('Error', data?.detail || 'Could not add this item.');
     }
