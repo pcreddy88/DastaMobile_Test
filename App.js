@@ -9028,7 +9028,8 @@ function CartScreen({ navigation, route }) {
 // total after free drinks.
 const CHECKOUT_TIP_PCTS = [10, 15, 20];
 // Custom tip picker: two linked wheels, $ in $0.25 steps and % in 1%
-// steps, from 0 with no upper limit. The $ value is what's sent.
+// steps, from 0 with no upper limit; every value carries its own unit.
+// The $ value is what's sent.
 const TIP_WHEEL_USD_STEP = 25; // cents
 const TIP_WHEEL_DRAG_PX = 20;  // swipe distance per step
 const CHECKOUT_COMPACT_H = 72; // free drink / Dasta Card boxes and the tip picker
@@ -9125,6 +9126,7 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
   // own init ("!d.is_open_now ... scheduledTime = pickup_slots[0]").
   const [pickupType, setPickupType] = useState('asap');
   const [scheduledTime, setScheduledTime] = useState(null);
+  const [slotsOpen, setSlotsOpen] = useState(false); // inline pickup-time drop-down
   // Have a gift card? (2026-09-13, PC's ask) -- same POST /checkout/confirm
   // gift_card_number/gift_card_redeem_code fields checkout_router.py's
   // _redeem_gift_card-at-checkout branch already accepts; nothing new
@@ -9291,10 +9293,23 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
     setSelectedTender(added ? cardRefOf(added) : stillThere ? selectedTender : defaultTender(data));
   };
 
-  const formatSlot = (iso) => {
-    const dt = new Date(iso);
-    return dt.toLocaleString('en-US', { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+  // Pickup slots: "Fri 2:00 PM" on the button; in the drop-down, a day
+  // header (Today / Tomorrow / "Sat Oct 11") over "2:00 PM" rows.
+  const slotTime = (iso) => new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  const slotButtonLabel = (iso) => `${new Date(iso).toLocaleDateString('en-US', { weekday: 'short' })} ${slotTime(iso)}`;
+  const slotDayLabel = (iso) => {
+    const d = new Date(iso), today = new Date();
+    const dayDiff = Math.round((new Date(d.getFullYear(), d.getMonth(), d.getDate()) - new Date(today.getFullYear(), today.getMonth(), today.getDate())) / 86400000);
+    if (dayDiff === 0) return 'Today';
+    if (dayDiff === 1) return 'Tomorrow';
+    return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }).replace(',', '');
   };
+  const slotGroups = (summary?.pickup_slots || []).reduce((groups, iso) => {
+    const day = slotDayLabel(iso);
+    const last = groups[groups.length - 1];
+    if (last && last.day === day) last.slots.push(iso); else groups.push({ day, slots: [iso] });
+    return groups;
+  }, []);
 
   // Multi-voucher fix (2026-09-13, PC's live report) -- total_cents_with_
   // voucher/tax_cents_with_voucher are a fixed count=1 preview (see
@@ -9641,10 +9656,7 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
               <View style={{ height: CHECKOUT_COMPACT_H, marginTop: 10, flexDirection: 'row', borderRadius: 10, borderWidth: 1, borderColor: C.border, backgroundColor: C.white, overflow: 'hidden' }}>
                 {/* Selection band across the middle, behind both wheels. */}
                 <View pointerEvents="none" style={{ position: 'absolute', left: 6, right: 6, top: (CHECKOUT_COMPACT_H - 2 - 28) / 2, height: 28,
-                  borderRadius: 8, borderWidth: 1, borderColor: C.saffron, backgroundColor: '#FDEDE3', justifyContent: 'center' }}>
-                  <Text style={{ position: 'absolute', left: 10, color: C.saffron, fontSize: 13, fontWeight: '700' }}>$</Text>
-                  <Text style={{ position: 'absolute', right: 10, color: C.saffron, fontSize: 13, fontWeight: '700' }}>%</Text>
-                </View>
+                  borderRadius: 8, borderWidth: 1, borderColor: C.saffron, backgroundColor: '#FDEDE3' }} />
                 <TipWheel accessibilityLabel="tip amount" disabled={paying} onStep={stepUsdWheel} onDragging={setDialDragging}
                   above={customTip.cents > 0 ? fmt(stepTipCents(customTip, -1, tipBaseCents).cents) : null}
                   value={fmt(customTip.cents)}
@@ -9670,27 +9682,41 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
           <Pressable
             disabled={summary.is_open_now === false}
             style={[S.pickupPill, pickupType === 'asap' && S.pickupPillActive, summary.is_open_now === false && S.pickupPillDisabled]}
-            onPress={() => setPickupType('asap')}>
+            onPress={() => { setPickupType('asap'); setSlotsOpen(false); }}>
             <Text style={[S.pickupPillText, pickupType === 'asap' && S.pickupPillTextActive]} numberOfLines={1} adjustsFontSizeToFit>
-              {summary.is_open_now !== false ? 'ASAP · in 10 min' : 'ASAP'}
+              {summary.is_open_now !== false ? 'ASAP · in 10–15 min' : 'ASAP (7am–7pm daily)'}
             </Text>
           </Pressable>
-          <Pressable style={[S.pickupPill, pickupType === 'scheduled' && S.pickupPillActive]} onPress={() => setPickupType('scheduled')}>
-            <Text style={[S.pickupPillText, pickupType === 'scheduled' && S.pickupPillTextActive]} numberOfLines={1} adjustsFontSizeToFit>Schedule for later</Text>
+          <Pressable style={[S.pickupPill, pickupType === 'scheduled' && S.pickupPillActive]} onPress={() => setSlotsOpen(v => !v)}
+            accessibilityState={{ expanded: slotsOpen }}>
+            <Text style={[S.pickupPillText, pickupType === 'scheduled' && S.pickupPillTextActive]} numberOfLines={1} adjustsFontSizeToFit>
+              {pickupType === 'scheduled' && scheduledTime ? `Pick up at ${slotButtonLabel(scheduledTime)} ▾` : 'Schedule for later'}
+            </Text>
           </Pressable>
         </View>
-        {summary.is_open_now === false && (
-          <Text style={S.fieldHint}>We're open 7am–7pm daily — pick a time below.</Text>
-        )}
-        {pickupType === 'scheduled' && (
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 10 }} contentContainerStyle={{ gap: 8 }}>
-            {(summary.pickup_slots || []).map(iso => (
-              <Pressable key={iso} onPress={() => setScheduledTime(iso)}
-                style={[S.menuCatTab, scheduledTime === iso && S.menuCatTabActive]}>
-                <Text style={[S.menuCatTabText, scheduledTime === iso && S.menuCatTabTextActive]}>{formatSlot(iso)}</Text>
-              </Pressable>
-            ))}
-          </ScrollView>
+        {slotsOpen && (
+          <View style={{ marginTop: 8, borderRadius: 10, borderWidth: 1, borderColor: C.border, backgroundColor: C.white, overflow: 'hidden' }}>
+            <RNScrollView style={{ maxHeight: 5 * 40 }} nestedScrollEnabled keyboardShouldPersistTaps="handled">
+              {slotGroups.length === 0 && (
+                <Text style={{ color: C.black, fontSize: 13, padding: 12 }}>No pickup times available right now.</Text>
+              )}
+              {slotGroups.map(g => (
+                <View key={g.day}>
+                  <Text style={{ color: C.charcoal, fontSize: 12, fontWeight: '700', paddingHorizontal: 12, paddingTop: 8, paddingBottom: 4, backgroundColor: C.ivory }}>{g.day}</Text>
+                  {g.slots.map(iso => {
+                    const on = pickupType === 'scheduled' && scheduledTime === iso;
+                    return (
+                      <Pressable key={iso} onPress={() => { setScheduledTime(iso); setPickupType('scheduled'); setSlotsOpen(false); setPayError(''); }}
+                        accessibilityRole="radio" accessibilityState={{ checked: on }}
+                        style={{ height: 40, justifyContent: 'center', paddingHorizontal: 12, backgroundColor: on ? C.saffron : C.white }}>
+                        <Text style={{ color: on ? C.white : C.charcoal, fontSize: 14, fontWeight: on ? '700' : '400' }}>{slotTime(iso)}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              ))}
+            </RNScrollView>
+          </View>
         )}
         </>)}
 
