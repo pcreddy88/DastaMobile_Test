@@ -2,9 +2,9 @@ import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { StatusBar } from 'expo-status-bar';
 import * as WebBrowser from 'expo-web-browser';
-import { useState, useEffect, useRef, useContext, createContext, useCallback, forwardRef } from 'react';
+import { useState, useEffect, useRef, useContext, createContext, useCallback, forwardRef, useImperativeHandle } from 'react';
 import {
-  ActivityIndicator, Alert, AppState, Animated, Image, ImageBackground, Keyboard, KeyboardAvoidingView, Pressable,
+  ActivityIndicator, Alert, AppState, Animated, Image, ImageBackground, Keyboard, KeyboardAvoidingView, Modal, Pressable,
   ScrollView as RNScrollView, StyleSheet, Switch, Text, TextInput, View, Linking, useWindowDimensions, RefreshControl, Platform,
   PanResponder,
 } from 'react-native';
@@ -128,7 +128,7 @@ import QRCode from 'react-native-qrcode-svg';
 // them to a Circle. Native module: needs a new binary (app.json version
 // bumped to 1.1.0 so no OTA update can ever ship this to a 1.0.0 build).
 import { CameraView, useCameraPermissions } from 'expo-camera';
-import { StripeProvider, useStripe, CardField } from '@stripe/stripe-react-native';
+import { WebView } from 'react-native-webview';
 import { useFonts } from 'expo-font';
 // Direct per-weight subpath imports (2026-09-13) -- NOT the package's
 // barrel import. That index re-exports all 12 weight/style files as
@@ -170,92 +170,252 @@ import { ExpoSpeechRecognitionModule, useSpeechRecognitionEvent } from 'expo-spe
 // wired up anywhere in this file until now.
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 
-// ── Stripe (2026-09-13) ─────────────────────────────────────────
-// Same publishable key dastacafe.com's own checkout ships client-side
-// today (your-order_embed1.html's YO_PK, confirmed live on
-// https://www.dastacafe.com/your-order — a publishable key is meant to
-// ship in client code, never secret) — paired against whatever mode
-// (test/live) checkout_router.py's server-side secret key is currently
-// set to via SSM, same as web. Every PaymentSheet call in this app goes
-// through the exact same {client_secret, customer_session_client_secret}
-// contract checkout/reload/gift-card-purchase/gift-order-checkout-intent
-// already return server-side — nothing about the payment logic itself is
-// reinvented here, only the presentation layer (native PaymentSheet
-// instead of web's Payment Element) differs, because that's Stripe's own
-// supported approach for React Native.
-// Apple Pay merchant ID (2026-09-30) -- registered in Apple Developer (team
-// 5HS4BHJRAJ) with its Stripe-issued Apple Pay Payment Processing
-// certificate; also in app.json's @stripe/stripe-react-native plugin, which
-// writes the iOS in-app-payments entitlement at build time.
-const APPLE_PAY_MERCHANT_ID = 'merchant.com.dasta.sipsense';
+// ── Clover card payments (Dasta Test) ───────────────────────────
+// test.dastacafe.com takes cards through Clover's sandbox, not Stripe.
+// Card numbers never touch this app: CloverCardFields loads the API's
+// own /payments/clover/card-frame page in a WebView, which hosts Clover's
+// card fields and hands back a single-use token. Every money-moving
+// screen (Checkout, Add Money, Gift Card Purchase, Gift a Sip/Food
+// checkout) gets {payment_ref, clover: {...}} from its own endpoint and
+// passes it to the one shared payWithCard() below.
 // Dasta Card pay QR: how often the showing screen re-checks the current code
 // (2026-09-30). The server returns the same code until it's used or 15
 // minutes pass, so this only decides how fast a just-used code is replaced.
 const DASTA_CARD_QR_POLL_MS = 5000;
-const STRIPE_PK = 'pk_test_51TcXeSAjIpyPExHlMwwFuj3MIawyT6dAJrTUkMDeKQwOuWninGLbeMgAaNjwvTwq1H0lrYeskFQZYoret9LtsyO700mbeBK1On';
+const CLOVER_TOKENIZE_TIMEOUT_MS = 20000;
+const CLOVER_FRAME_LOAD_TIMEOUT_MS = 20000;
 
-// Shared PaymentSheet presenter — every money-moving screen (Checkout,
-// Add Money, Gift Card Purchase, Gift a Sip/Food checkout) calls this
-// exact same helper with its own client_secret, instead of four separate
-// copies of init/present/error-handling logic.
-function usePayWithSheet() {
-  const { initPaymentSheet, presentPaymentSheet } = useStripe();
-  return useCallback(async ({ clientSecret, customerSessionClientSecret, customerId }) => {
-    const { error: initError } = await initPaymentSheet({
-      merchantDisplayName: 'Dasta Cafe',
-      paymentIntentClientSecret: clientSecret,
-      // Apple Pay (iOS) / Google Pay (Android), 2026-09-30 -- Stripe shows
-      // the wallet button at the top of the sheet. Which methods appear
-      // otherwise comes from Stripe's Dashboard (every sheet-backed
-      // PaymentIntent uses automatic_payment_methods). Google Pay's test
-      // environment follows the same Stripe key the app is using.
-      applePay: { merchantCountryCode: 'US' },
-      googlePay: { merchantCountryCode: 'US', testEnv: STRIPE_PK.startsWith('pk_test_') },
-      // No Link in the app's sheet (PC, 2026-09-30) -- unfamiliar to a
-      // walk-in café customer, and its pay-by-bank option with it. Set here
-      // rather than relying on the Dashboard, so it holds in test and live.
-      link: { display: 'never' },
-      // Dasta look (PC, 2026-09-30) -- was Stripe's default white sheet with
-      // a blue Pay button. One palette for light and dark mode alike so the
-      // sheet always matches the app. (Apple Pay's own button stays black,
-      // per Apple's rules.)
-      appearance: {
-        colors: {
-          primary: C.saffron, background: C.ivory, componentBackground: C.white,
-          componentBorder: C.border, componentDivider: C.border,
-          primaryText: C.charcoal, secondaryText: C.espresso, componentText: C.charcoal,
-          placeholderText: C.muted, icon: C.espresso, error: '#C0392B',
-        },
-        shapes: { borderRadius: 12, borderWidth: 1 },
-        primaryButton: {
-          colors: { background: C.saffron, text: C.white, border: C.saffron },
-          shapes: { borderRadius: 12 },
-        },
-      },
-      // customerId (2026-09-13 fix, PC's live report) -- REQUIRED alongside
-      // customerSessionClientSecret for saved cards to show at all on
-      // mobile: stripe-react-native's iOS bridge only builds the Customer
-      // Session config when customerId is also present (confirmed by
-      // reading StripeSdkImpl+PaymentSheet.swift -- the whole
-      // `configuration.customer = ...` assignment lives inside
-      // `if let customerId = params["customerId"]`). Every backend
-      // endpoint that returns customerSessionClientSecret now also returns
-      // stripe_customer_id for exactly this reason -- see checkout_router.py/
-      // wallet_router.py/gift_orders_router.py's matching comment.
-      customerId: customerId || undefined,
-      customerSessionClientSecret: customerSessionClientSecret || undefined,
-      allowsDelayedPaymentMethods: false,
-    });
-    if (initError) return { ok: false, error: initError.message };
-    const { error: presentError } = await presentPaymentSheet();
-    if (presentError) {
-      // Stripe's own "Canceled" code — the customer backed out, not a
-      // real failure; every caller treats this as a silent no-op.
-      if (presentError.code === 'Canceled') return { ok: false, canceled: true };
-      return { ok: false, error: presentError.message };
+// Card-frame protocol (all messages are JSON via ReactNativeWebView.postMessage):
+//   page → app  {type:'ready'} once Clover's fields are loaded
+//   app → page  window.dastaTokenize()
+//   page → app  {type:'token', token, card:{brand,last4,exp_month,exp_year}}
+//               or {type:'error', message}
+// ref.tokenize() resolves {ok:true, token, card} or {ok:false, error}.
+const CloverCardFields = forwardRef(function CloverCardFields({ onReady }, ref) {
+  const webRef = useRef(null);
+  const pending = useRef(null); // {resolve, timer} for the tokenize() in flight
+  const [ready, setReady] = useState(false);
+  const [loadError, setLoadError] = useState('');
+  const [loadKey, setLoadKey] = useState(0); // bumped by "Try again" to remount the WebView
+
+  const settle = (result) => {
+    const p = pending.current;
+    if (!p) return;
+    pending.current = null;
+    clearTimeout(p.timer);
+    p.resolve(result);
+  };
+  useEffect(() => () => settle({ ok: false, error: 'The card form was closed.' }), []);
+
+  // Don't spin forever if the page never says it's ready.
+  useEffect(() => {
+    if (ready || loadError) return;
+    const t = setTimeout(() => setLoadError('The card form took too long to load.'), CLOVER_FRAME_LOAD_TIMEOUT_MS);
+    return () => clearTimeout(t);
+  }, [ready, loadError, loadKey]);
+
+  useImperativeHandle(ref, () => ({
+    tokenize: () => {
+      if (!ready || !webRef.current) return Promise.resolve({ ok: false, error: 'The card form is still loading.' });
+      settle({ ok: false, error: 'Replaced by a newer card check.' }); // only one in flight
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => settle({ ok: false, error: 'Checking your card timed out. Please try again.' }), CLOVER_TOKENIZE_TIMEOUT_MS);
+        pending.current = { resolve, timer };
+        webRef.current.injectJavaScript('window.dastaTokenize(); true;');
+      });
+    },
+  }), [ready]);
+
+  const onMessage = (e) => {
+    // Only trust messages from our own card-frame page.
+    if (!(e.nativeEvent.url || '').startsWith(API_BASE_URL)) return;
+    let msg;
+    try { msg = JSON.parse(e.nativeEvent.data); } catch { return; }
+    if (msg?.type === 'ready') { setReady(true); setLoadError(''); onReady?.(); return; }
+    if (msg?.type === 'token' && msg.token) { settle({ ok: true, token: msg.token, card: msg.card || null }); return; }
+    if (msg?.type === 'error') {
+      const message = msg.message || 'Please check your card details.';
+      if (pending.current) settle({ ok: false, error: message });
+      else if (!ready) setLoadError(message);
     }
-    return { ok: true };
-  }, [initPaymentSheet, presentPaymentSheet]);
+  };
+
+  const failLoad = () => { setReady(false); setLoadError('Could not load the card form.'); };
+  const retry = () => { setReady(false); setLoadError(''); setLoadKey(k => k + 1); };
+
+  return (
+    <View style={{ height: 160, marginTop: 12, marginBottom: 4, borderRadius: 10, overflow: 'hidden', backgroundColor: C.white, borderWidth: 1, borderColor: C.border }}>
+      {!loadError && (
+        <WebView
+          key={loadKey}
+          ref={webRef}
+          source={{ uri: `${API_BASE_URL}/payments/clover/card-frame` }}
+          originWhitelist={['https://*']}
+          // Clover's own iframes load inside the page; the page itself must
+          // never navigate the top frame somewhere else.
+          onShouldStartLoadWithRequest={(req) => req.isTopFrame === false || req.url.startsWith(API_BASE_URL)}
+          onMessage={onMessage}
+          onError={failLoad}
+          onHttpError={failLoad}
+          scrollEnabled={false}
+          style={{ backgroundColor: 'transparent' }}
+        />
+      )}
+      {!ready && !loadError && (
+        <View style={[StyleSheet.absoluteFill, { alignItems: 'center', justifyContent: 'center', backgroundColor: C.white }]}>
+          <ActivityIndicator color={C.saffron} />
+        </View>
+      )}
+      {!!loadError && (
+        <View style={[StyleSheet.absoluteFill, { alignItems: 'center', justifyContent: 'center', padding: 16 }]}>
+          <Text style={{ color: '#C0392B', textAlign: 'center' }}>{loadError}</Text>
+          <Pressable onPress={retry} style={{ marginTop: 8 }}>
+            <Text style={S.linkText}>Try again</Text>
+          </Pressable>
+        </View>
+      )}
+    </View>
+  );
+});
+
+// payWithCard(data) -- data is the endpoint's own response
+// ({payment_ref, clover: {saved_cards, preselect_card_id, can_save_card}}).
+// Resolves {ok:true}, {ok:false, canceled:true} or {ok:false, error}.
+// A payment that fails inside the sheet (e.g. a decline) shows the API's
+// message there and lets the customer retry, so callers only ever see
+// success or a cancel.
+const CloverPayContext = createContext(null);
+function usePayWithCard() {
+  return useContext(CloverPayContext);
+}
+
+function CloverPayProvider({ children }) {
+  const [request, setRequest] = useState(null); // {id, data}
+  const resolver = useRef(null);
+  const nextId = useRef(0);
+
+  const finish = useCallback((result) => {
+    const resolve = resolver.current;
+    resolver.current = null;
+    setRequest(null);
+    resolve?.(result);
+  }, []);
+
+  const payWithCard = useCallback((data) => {
+    if (!data?.payment_ref) return Promise.resolve({ ok: false, error: 'Payment could not be started. Please try again.' });
+    resolver.current?.({ ok: false, canceled: true }); // a newer payment replaces any open one
+    return new Promise((resolve) => {
+      resolver.current = resolve;
+      nextId.current += 1;
+      setRequest({ id: nextId.current, data });
+    });
+  }, []);
+
+  return (
+    <CloverPayContext.Provider value={payWithCard}>
+      {children}
+      {request && <CloverPaySheet key={request.id} data={request.data} onDone={finish} />}
+    </CloverPayContext.Provider>
+  );
+}
+
+function CloverPaySheet({ data, onDone }) {
+  const insets = useSafeAreaInsets();
+  const clover = data.clover || {};
+  const savedCards = clover.saved_cards || [];
+  const [choice, setChoice] = useState(() =>
+    savedCards.some(c => c.id === clover.preselect_card_id) ? clover.preselect_card_id : 'new');
+  const [saveCard, setSaveCard] = useState(false);
+  const [fieldsReady, setFieldsReady] = useState(false);
+  const [paying, setPaying] = useState(false);
+  const [error, setError] = useState('');
+  const [inProgress, setInProgress] = useState(false); // 409: an earlier Pay is still being processed
+  const fieldsRef = useRef(null);
+
+  const cancel = () => { if (!paying) onDone({ ok: false, canceled: true }); };
+
+  const pay = async () => {
+    setPaying(true); setError('');
+    let body;
+    if (choice === 'new') {
+      const t = (await fieldsRef.current?.tokenize()) || { ok: false };
+      if (!t.ok) { setPaying(false); setError(t.error || 'Please check your card details.'); return; }
+      body = { payment_ref: data.payment_ref, token: t.token, card: t.card, save_card: !!(clover.can_save_card && saveCard) };
+    } else {
+      body = { payment_ref: data.payment_ref, saved_card_id: choice };
+    }
+    // success also covers status 'authorized' (a group-order hold).
+    const res = await apiFetch('/payments/clover/confirm', { method: 'POST', body, timeoutMs: 45000 });
+    if (res.ok && res.data?.success) { onDone({ ok: true }); return; }
+    setPaying(false);
+    // 409: an earlier Pay for this payment_ref is still being charged.
+    // Don't invite another tap -- the server blocks repeats for ~2 minutes.
+    if (res.status === 409) {
+      setInProgress(true);
+      setError(`${res.data?.detail || 'This payment is already being processed.'} Check your order history in a minute.`);
+      return;
+    }
+    setError(res.data?.detail || (res.networkError
+      ? "We couldn't reach Dasta to confirm your payment. Please check your connection and try again."
+      : 'Your payment could not be completed. Please try again.'));
+  };
+
+  const payDisabled = paying || inProgress || (choice === 'new' && !fieldsReady);
+  const radio = (selected) => (
+    <Ionicons name={selected ? 'radio-button-on' : 'radio-button-off'} size={20} color={selected ? C.saffron : C.muted} />
+  );
+
+  return (
+    <Modal visible transparent animationType="slide" onRequestClose={cancel}>
+      <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'flex-end' }}>
+        <Pressable style={StyleSheet.absoluteFill} onPress={cancel} />
+        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={{ width: '100%' }}>
+          <View style={[S.modalSheet, { maxHeight: '90%' }]}>
+            <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ padding: 20, paddingBottom: 28 + insets.bottom }}>
+              <Text style={S.drinkFullName}>Pay with card</Text>
+
+              {savedCards.map(c => (
+                <Pressable key={c.id} disabled={paying || inProgress} onPress={() => { setChoice(c.id); setError(''); }}
+                  accessibilityRole="radio" accessibilityState={{ checked: choice === c.id }}
+                  style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: C.border }}>
+                  {radio(choice === c.id)}
+                  <Text style={{ color: C.black, fontSize: 15, flex: 1 }}>{c.display}</Text>
+                </Pressable>
+              ))}
+              <Pressable disabled={paying || inProgress} onPress={() => { if (choice !== 'new') setFieldsReady(false); setChoice('new'); setError(''); }}
+                accessibilityRole="radio" accessibilityState={{ checked: choice === 'new' }}
+                style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 12 }}>
+                {radio(choice === 'new')}
+                <Text style={{ color: C.black, fontSize: 15, flex: 1 }}>Use a new card</Text>
+              </Pressable>
+
+              {choice === 'new' && (
+                <>
+                  <CloverCardFields ref={fieldsRef} onReady={() => setFieldsReady(true)} />
+                  {!!clover.can_save_card && (
+                    <Pressable disabled={paying || inProgress} onPress={() => setSaveCard(v => !v)}
+                      accessibilityRole="checkbox" accessibilityState={{ checked: saveCard }}
+                      style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 10 }}>
+                      <Ionicons name={saveCard ? 'checkbox' : 'square-outline'} size={20} color={saveCard ? C.saffron : C.muted} />
+                      <Text style={{ color: C.black, fontSize: 14 }}>Save this card for next time</Text>
+                    </Pressable>
+                  )}
+                </>
+              )}
+
+              {!!error && <Text style={{ color: '#C0392B', marginTop: 8 }}>{error}</Text>}
+              <Pressable style={[S.btnSaffron, { marginTop: 16 }, payDisabled && { opacity: 0.6 }]} disabled={payDisabled} onPress={pay}>
+                {paying ? <ActivityIndicator color={C.ivory} /> : <Text style={S.btnSaffronText}>Pay</Text>}
+              </Pressable>
+              <Pressable onPress={cancel} disabled={paying} style={{ marginTop: 4, alignItems: 'center', opacity: paying ? 0.4 : 1 }}>
+                <Text style={[S.linkText, { color: C.black }]}>{inProgress ? 'Close' : 'Cancel'}</Text>
+              </Pressable>
+            </ScrollView>
+          </View>
+        </KeyboardAvoidingView>
+      </View>
+    </Modal>
+  );
 }
 
 // ── Face ID / Touch ID quick-unlock (2026-09-12) ───────────────
@@ -726,7 +886,7 @@ const C = {
   border:   '#E8E2D6',
 };
 
-const API_BASE_URL = 'https://api.dastacafe.com';
+const API_BASE_URL = 'https://api.test.dastacafe.com';
 const Stack = createNativeStackNavigator();
 
 // ── Wide-screen breakpoint (2026-09-17) ───────────────────────────
@@ -1785,13 +1945,8 @@ function FavoriteDetailModal({ drink, visible, onClose, customer, navigation, on
           ? { item_type: 'food', food_item_id: drink.food_item_id, drink_name: drink.drink_name, unit_price_cents: 0, quantity: 1 }
           : { item_type: 'drink', drink_source: 'dasta_menu', dasta_menu_item_id: drink.dasta_menu_item_id, selected_modifier_ids: catalogModifierIds(), unit_price_cents: 0, quantity: 1 };
         const { ok, data } = await cart.addToCart(payload);
-        // onOk defers the actual onClose() until the customer dismisses
-        // the InfoModal -- unlike Alert.alert (an OS-level overlay), this
-        // modal lives inside FavoriteDetailModal's own render tree and
-        // would vanish instantly if onClose() fired synchronously (it
-        // sets the parent's `visible` false, and line ~1204's early
-        // return unmounts everything, InfoModal included).
-        if (ok && data?.success) showInfo('Added to Cart 🛒', `${drink.drink_name} — added to your order!`, onClose);
+        // No "Added to Cart" popup -- the header's cart badge shows it.
+        if (ok && data?.success) onClose();
         else showInfo('Error', data?.detail || 'Could not add to your order.');
       } else {
         // Custom/Circle/Menu sip — same presetDrink path the Order tab's
@@ -2638,7 +2793,7 @@ function SignInScreen({ navigation }) {
   // the moment the redirect_uri below is hit, matching how a native
   // OAuth handoff should feel rather than a lingering browser tab.
   //
-  // dastasipsense:// (app.json's new "scheme") is what closes the loop —
+  // dastasipsensetest:// (app.json's "scheme") is what closes the loop —
   // /auth/social/callback/<provider>'s final redirect target.
   //
   // REAL BUG found on a real device (2026-09-16): this used to assume iOS
@@ -2657,7 +2812,7 @@ function SignInScreen({ navigation }) {
   const handleSocialSignIn = async (provider, label) => {
     setLoading(true); setError('');
     try {
-      const redirectUrl = 'dastasipsense://auth-callback'; // matches app.json's "scheme"
+      const redirectUrl = 'dastasipsensetest://auth-callback'; // matches app.json's "scheme"
       const authUrl = `${API_BASE_URL}/auth/login?provider=${provider}&redirect_to=${encodeURIComponent(redirectUrl)}`;
       const result = await WebBrowser.openAuthSessionAsync(authUrl, redirectUrl);
       if (result.type === 'cancel' || result.type === 'dismiss') { setLoading(false); return; } // customer backed out — not an error
@@ -3946,9 +4101,6 @@ function OrderScreen({ route, navigation, onHeaderBack }) {
             await apiFetch('/sip/craft-the-sip', { method: 'POST', body: { custom_drink_id: data.custom_drink_id } });
           } catch {}
           setBuilding(false);
-          showInfo('Added to Cart 🛒', `${drink.custom_drink?.drink_name || 'Your custom sip'} is built and in your cart — checkout whenever you're ready.`);
-        } else {
-          showInfo('Added to Cart 🛒', `${drink.custom_drink?.drink_name || 'Your custom sip'} is in your cart — checkout whenever you're ready.`);
         }
       } else {
         showInfo('Error', data?.detail || 'Could not add to cart.');
@@ -3978,7 +4130,6 @@ function OrderScreen({ route, navigation, onHeaderBack }) {
       });
       if (ok && data?.success) {
         setCircleOrdered(true);
-        showInfo('Added to Cart 🛒', `${circle.drink_name} is in your cart — checkout whenever you're ready.`);
       } else {
         showInfo('Error', data?.detail || 'Could not add to cart.');
       }
@@ -4004,7 +4155,6 @@ function OrderScreen({ route, navigation, onHeaderBack }) {
       });
       if (ok && data?.success) {
         setMenuOrdered(true);
-        showInfo('Added to Cart 🛒', `${menu.drink_name} is in your cart — checkout whenever you're ready.`);
       } else {
         showInfo('Error', data?.detail || 'Could not add to cart.');
       }
@@ -5081,7 +5231,7 @@ function LeafLoyaltyDemoScreen({ navigation, onHeaderBack }) {
 // Clover pricing, so this can never show a stale copy of the menu.
 // Modifier-based add-to-cart (the same endpoint also carries modifier
 // groups) is intentionally NOT built here — that's tied to the same
-// not-yet-built cart/Stripe checkout flagged elsewhere in Craft My
+// not-yet-built cart/card checkout flagged elsewhere in Craft My
 // Drink; this is browse-only, matching what was actually asked for.
 // ── MENU ITEM MODAL (2026-09-13) ─────────────────────────────────
 // Ported from dasta-menu_embed1.html's modifier popup: tapping a Dasta
@@ -5198,7 +5348,10 @@ function MenuItemPanel({ item, onClose, cart, customer, navigation, showInfo }) 
     const { ok, data } = kind === 'order' ? await cart.addToCart(payload) : await cart.addToGift(payload);
     setAdding(null);
     if (ok && data?.success) {
-      showInfo(kind === 'order' ? 'Added to Cart 🛒' : 'Added to Gift 🎁', `${item.name} — ${quantity}x`, onClose);
+      // Added to the cart: no popup (the header's cart badge already shows
+      // it), just back to the menu.
+      if (kind === 'order') onClose();
+      else showInfo('Added to Gift 🎁', `${item.name} — ${quantity}x`, onClose);
     } else {
       showInfo('Error', data?.detail || 'Could not add this item.');
     }
@@ -6181,13 +6334,8 @@ function SignInContactScreen({ navigation }) {
 // Dasta Card and Credit/Debit Card are real, live data (GET /wallet/
 // balance, POST /wallet/qr-token, GET/DELETE /wallet/cards -- all
 // already-shipped endpoints, require_wallet_session accepts the normal
-// session cookie, no special step-up). Adding a NEW card needs Stripe's
-// SetupIntent flow, which needs Stripe's own React Native SDK -- a
-// separate, substantial integration on its own (PCI scope, Apple Pay
-// hooks), intentionally not started here; "Add a Card" and "Reload
-// Dasta Cash" open the real dastacafe.com flow instead rather than a
-// half-built native one, same pattern already used for Circle/Menu Sip
-// checkout elsewhere in this app.
+// session cookie, no special step-up). Adding a NEW card goes through
+// AddCardModal (Clover card fields).
 // Bundled (2026-10-01): the Webflow-hosted DastaCard_blank_template.png with
 // its printed "DASTA CARD" lettering thickened ~1px for a bold look (PC's ask).
 // The lettering is part of the image, not app text, so it can't be styled.
@@ -6224,14 +6372,14 @@ const TX_ICONS = {
 
 // Expanded transaction detail (PC, 2026-10-01): date with time, and how a
 // purchase was paid, from the tender fields GET /wallet/transactions/{id}/
-// detail already returns. card_payment_method holds the wallet type
-// (apple_pay/google_pay), the card brand, or the bare PaymentMethod type.
+// detail already returns. card_brand holds the card brand, or the bare
+// payment method type.
 function formatTxDateTime(iso) {
   const d = new Date(iso);
   return `${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })} · ${d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`;
 }
 const TX_CARD_METHOD_LABELS = {
-  apple_pay: 'Apple Pay', google_pay: 'Google Pay', link: 'Link', card: 'Card',
+  card: 'Card',
   visa: 'Visa card', mastercard: 'Mastercard', amex: 'American Express card', discover: 'Discover card',
 };
 function txPaidWith(detail) {
@@ -6410,33 +6558,25 @@ function AutoReloadModal({ visible, onClose, identifier, savedCards, current, on
   );
 }
 
-// ── Add a Card, native (2026-09-17) ───────────────────────────────
-// Replaces the "Add a Card on dastacafe.com" web handoff -- same backend
-// SetupIntent endpoint web's own Stripe.js Elements flow already used
-// (POST /wallet/setup-card), just confirmed here via the RN SDK's
-// CardField + confirmSetupIntent instead of Elements. No new backend
-// endpoint, no new persistence logic: setup-card's own doc comment says
-// the card is stored in payment_methods on the setup_intent.succeeded
-// STRIPE WEBHOOK, not synchronously in this request/response -- so a
-// successful confirmSetupIntent here means Stripe accepted the card, not
-// that GET /wallet/cards will show it yet. onCardSaved (fetchCards,
-// passed down) is polled a few times after confirmation, watching for
-// the new stripe_pm_id to actually land, same "webhook may take a beat"
-// reality the reload flow's own GET /reload-status/{id} polling already
-// works around for charges -- no separate mechanism invented here.
+// ── Add a Card, native (2026-09-17; Clover for Dasta Test) ─────────
+// POST /wallet/setup-card first (it gates the step-up below and returns
+// data.clover), then CloverCardFields tokenizes the card and POST
+// /payments/clover/cards saves it. The save is synchronous, so the card
+// is already in GET /wallet/cards by the time onCardSaved runs.
 //
 // Same _require_fresh_auth step-up as setting up auto-reload (identical
 // risk class per wallet_router.py's own comment on setup-card): reuses
-// AutoReloadModal's exact reauth sub-flow rather than a second copy,
-// just retrying startSetup() instead of submitEnable() afterward.
+// AutoReloadModal's exact reauth sub-flow rather than a second copy.
+// After re-auth it retries whichever call got the 401 -- startSetup(),
+// or the save with the token already in hand.
 function AddCardModal({ visible, onClose, identifier, onCardSaved }) {
-  const { confirmSetupIntent } = useStripe();
-  const [clientSecret, setClientSecret] = useState(null);
-  const [cardComplete, setCardComplete] = useState(false);
+  const cardFieldsRef = useRef(null);
+  const pendingSave = useRef(null); // {token, card} waiting on re-auth
+  const [setupReady, setSetupReady] = useState(false);
+  const [fieldsReady, setFieldsReady] = useState(false);
   const [loadingSetup, setLoadingSetup] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
-  const [notice, setNotice] = useState(''); // success-toned message, distinct from error's red text
   const [reauthStep, setReauthStep] = useState(null); // null (loading/form) | 'code'
   const [reauthSession, setReauthSession] = useState(null);
   const [reauthChallengeName, setReauthChallengeName] = useState(null);
@@ -6444,17 +6584,18 @@ function AddCardModal({ visible, onClose, identifier, onCardSaved }) {
   const [reauthCode, setReauthCode] = useState('');
 
   const startSetup = async () => {
-    setLoadingSetup(true); setError(''); setClientSecret(null); setCardComplete(false);
+    setLoadingSetup(true); setError(''); setSetupReady(false); setFieldsReady(false);
     const { ok, status, data } = await apiFetch('/wallet/setup-card', { method: 'POST' });
     setLoadingSetup(false);
-    if (ok && data?.success) { setClientSecret(data.client_secret); return; }
+    if (ok && data?.success) { setSetupReady(true); return; }
     if (status === 401) { startReauth(); return; }
     setError(data?.detail || 'Could not start adding a card. Please try again.');
   };
 
   useEffect(() => {
     if (!visible) return;
-    setReauthStep(null); setReauthCode(''); setError(''); setNotice('');
+    pendingSave.current = null;
+    setReauthStep(null); setReauthCode(''); setError('');
     startSetup();
   }, [visible]);
 
@@ -6493,43 +6634,36 @@ function AddCardModal({ visible, onClose, identifier, onCardSaved }) {
     }
     // Fresh auth_time is now on the session — retry the original call.
     setReauthStep(null);
+    const retrySave = pendingSave.current;
+    pendingSave.current = null;
+    if (retrySave) { setLoadingSetup(false); await submitCard(retrySave); return; }
     await startSetup();
   };
 
-  // Poll for the webhook-persisted card (see file comment above) -- up to
-  // 5 tries, 1s apart. Stripe already told us the card is good by the
-  // time this runs (confirmSetupIntent resolved without an error), so
-  // this is purely "wait for our own DB to catch up," not a retry of
-  // anything that could still fail.
-  const waitForCard = async (pmId) => {
-    for (let i = 0; i < 5; i++) {
-      const cards = await onCardSaved();
-      if (cards?.some(c => c.stripe_pm_id === pmId)) return true;
-      await new Promise(r => setTimeout(r, 1000));
+  const submitCard = async (payload) => {
+    setSaving(true); setError('');
+    const { ok, status, data } = await apiFetch('/payments/clover/cards', { method: 'POST', body: payload, timeoutMs: 20000 });
+    if (status === 401) { setSaving(false); setFieldsReady(false); pendingSave.current = payload; startReauth(); return; }
+    if (!ok || data?.success === false) {
+      setSaving(false);
+      setError(data?.detail || 'That card could not be saved. Please check the details and try again.');
+      return;
     }
-    return false;
+    await onCardSaved();
+    setSaving(false);
+    onClose();
   };
 
   const handleSaveCard = async () => {
-    if (!clientSecret || !cardComplete) return;
+    if (!setupReady || !fieldsReady || saving) return;
     setSaving(true); setError('');
-    const { setupIntent, error: confirmError } = await confirmSetupIntent(clientSecret, { paymentMethodType: 'Card' });
-    if (confirmError) {
+    const t = (await cardFieldsRef.current?.tokenize()) || { ok: false };
+    if (!t.ok) {
       setSaving(false);
-      setError(confirmError.message || 'That card could not be saved. Please check the details and try again.');
+      setError(t.error || 'Please check your card details and try again.');
       return;
     }
-    const pmId = setupIntent?.paymentMethod?.id || setupIntent?.paymentMethodId;
-    const landed = await waitForCard(pmId);
-    setSaving(false);
-    if (landed) { onClose(); return; }
-    // Stripe already confirmed the card; our own list just hasn't caught
-    // up to the webhook yet (see file comment). Don't silently close as
-    // if nothing happened -- say so, then close; the list already has
-    // one more fetchCards() call queued behind whatever the customer
-    // does next (screen focus, pull-to-refresh, etc.) that'll pick it up.
-    setNotice('Card saved! It may take a moment to appear in your list below.');
-    setTimeout(onClose, 1800);
+    await submitCard({ token: t.token, card: t.card });
   };
 
   if (!visible) return null;
@@ -6545,7 +6679,7 @@ function AddCardModal({ visible, onClose, identifier, onCardSaved }) {
           moves content, so undefined left the fields under the keyboard. */}
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={{ width: '100%' }}>
       <View style={S.modalSheet}>
-        <ScrollView contentContainerStyle={{ padding: 20, paddingBottom: 28 }}>
+        <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ padding: 20, paddingBottom: 28 }}>
           {reauthStep === 'code' ? (
             <>
               <Text style={S.drinkFullName}>Confirm it's you</Text>
@@ -6560,25 +6694,15 @@ function AddCardModal({ visible, onClose, identifier, onCardSaved }) {
           ) : (
             <>
               <Text style={S.drinkFullName}>Add a Card</Text>
-              <Text style={S.cardSub}>Your card details go straight to Stripe -- Dasta never sees or stores your full card number.</Text>
+              <Text style={S.cardSub}>Your card details go straight to Clover -- Dasta never sees or stores your full card number.</Text>
 
               {loadingSetup ? (
                 <ActivityIndicator color={C.saffron} style={{ marginTop: 24 }} />
-              ) : clientSecret ? (
+              ) : setupReady ? (
                 <>
-                  <CardField
-                    postalCodeEnabled={false}
-                    placeholders={{ number: '4242 4242 4242 4242' }}
-                    cardStyle={{
-                      backgroundColor: C.ivory, borderRadius: 10, borderWidth: 1, borderColor: C.border,
-                      textColor: C.charcoal, placeholderColor: C.muted, fontSize: 15,
-                    }}
-                    style={{ width: '100%', height: 50, marginTop: 16, marginBottom: 4 }}
-                    onCardChange={(details) => setCardComplete(details.complete)}
-                  />
+                  <CloverCardFields ref={cardFieldsRef} onReady={() => setFieldsReady(true)} />
                   {!!error && <Text style={{ color: '#C0392B', marginTop: 8 }}>{error}</Text>}
-                  {!!notice && <Text style={{ color: '#2a8f4f', marginTop: 8 }}>{notice}</Text>}
-                  <Pressable style={[S.btnSaffron, { marginTop: 16 }]} disabled={!cardComplete || saving} onPress={handleSaveCard}>
+                  <Pressable style={[S.btnSaffron, { marginTop: 16 }, (!fieldsReady || saving) && { opacity: 0.6 }]} disabled={!fieldsReady || saving} onPress={handleSaveCard}>
                     {saving ? <ActivityIndicator color={C.ivory} /> : <Text style={S.btnSaffronText}>Save Card</Text>}
                   </Pressable>
                 </>
@@ -6904,7 +7028,7 @@ function MyCircleAccountScreen({ navigation, route, onHeaderBack }) {
   // reduction... a stale auth_time must never block a customer trying
   // to turn OFF"). Enabling/editing needs consent copy + a fresh-auth
   // step-up + card selection, which stays on dastacafe.com for now —
-  // same "don't half-build the Stripe-adjacent flow" call made
+  // same "don't half-build the payment-adjacent flow" call made
   // elsewhere in this app.
   //
   // Branded confirmation (2026-09-14, PC's ask) — same real toggle-off
@@ -7122,7 +7246,7 @@ function MyCircleAccountScreen({ navigation, route, onHeaderBack }) {
       </Pressable>
 
       {/* Quick actions (2026-09-12) — Transaction History is real, native
-          data (GET /wallet/transactions, no Stripe involved); the other
+          data (GET /wallet/transactions, no card payment involved); the other
           four open the real dastacafe.com flow rather than a half-built
           native gift-card/payment UI, same pattern as "Add a Card"
           above and Circle/Menu Sip checkout elsewhere in this app. */}
@@ -7520,9 +7644,9 @@ const DEFAULT_CONTENT_PAGES = {
   "journey-to-dasta": { title: "The Journey to Dasta", data: {"founder":{"name":"Sandeep Reddy","title":"Founder","initials":"SR"},"pullQuote":"“What began as a search for the perfect cup became a vision to share it.” — Sandeep Reddy","visionItems":["Authentic, culturally rich tea experiences","Unique East-meets-West concept","Operational excellence","Community-centered environment"],"visionHeading":"My Vision","journeyHeading":"The Journey to Dasta","journeyParagraphs":["Born and raised in Wisconsin, Sandeep Reddy is a graduate of Emory University with a degree in Financial Economics. But his journey into building Dasta did not begin in a classroom. It began on the streets of Hyderabad.","During his four years in India, Sandeep fell in love with chai culture. It was never just about the drink. It was about the experience. The warmth of the cup, the depth of spice, the aroma in the air. Each sip carried layers of flavor that lingered long after, almost dancing on the palate. What started as a simple routine quickly became something more meaningful: an appreciation for chai as a ritual, not just a beverage.","Inspired by this experience, Sandeep continued to explore the many variations of chai found not only in Hyderabad, but across India. At the same time, he launched a food and beverage venture in Hyderabad, where he worked alongside partners to build and operate Quake Arena, now ranked among the world’s top nightlife destinations—recognized as the 30th best nightclub globally and the number one nightclub in India. Together, they also developed a convention center with bookable halls designed to host large-scale events. Through these ventures, Sandeep gained hands-on experience across hospitality, entertainment, and food and beverage operations—yet throughout it all, his passion for chai remained a constant.","Now back in the United States, Sandeep realized that something he had come to value deeply during his time in India was missing: authentic, freshly brewed chai. He observed that many chain coffee shops, as well as specialty and artisanal cafés, relied on pre-made chai concentrates rather than traditional brewing methods. This contrast was disheartening. In that moment, his vision became clear—to recreate the experience he had fallen in love with and introduce it through a new kind of café, one rooted in authenticity, ritual, and innovation.","At Dasta, this vision comes to life through a simple yet powerful idea: East meets West; two rituals, one space.","Sandeep sought a way to thoughtfully introduce the ritual of chai, and believed that an authentic New York–style bagel — an already well-established ritual—would serve as the perfect bridge. The rich, traditional flavors of South Asian chai, paired with the iconic New York bagel, create a truly balanced experience—not just as food and drink, but as a daily ritual.","At Dasta, every detail reflects that vision. From authentic chai brewed with traditional spices to high-quality bagels inspired by New York classics, the menu blends culture and taste, introducing new flavors to curious minds. The space is designed for both productivity and comfort, giving students a place to focus while also offering a sense of familiarity to those far from home—a space that feels both globally inspired and locally loved.","But most importantly, it is about bringing people together through shared rituals. Because sometimes, the best moments do not come from rushing. Sometimes they come when you sit down and relax—with a cup of chai in hand."],"managementHeading":"Management Team","managementParagraph":"Dasta is supported by a team with experience in hospitality, customer service, and small business operations. Together, they ensure consistency in quality, service, and execution—bringing the brand’s vision to life every day."} },
   "academic-references": { title: "The Science of Study Fuel", data: {"intro":"At Dasta, we don't just sell drinks. We help you choose the right fuel for your academic moment.","heading":"The Science of Study Fuel","sources":["1. Fredholm, B. B., et al. (1999). Actions of caffeine in the brain. Pharmacological Reviews, 51(1), 83–133.","2. Smith, A. (2002). Effects of caffeine on human behavior. Food and Chemical Toxicology, 40(9), 1243–1255.","3. Juneja, L. R., et al. (1999). L-theanine and relaxation effects in humans. Trends in Food Science & Technology, 10(6–7), 199–204.","4. Haskell, C. F., et al. (2008). The combined effects of L-theanine and caffeine on cognitive performance and mood. Biological Psychology, 77(2), 113–122.","5. Institute of Medicine. (2001). Caffeine for the sustainment of mental task performance. National Academies Press.","6. Armstrong, L. E., et al. (2005). Caffeine and fluid balance. Exercise and Sport Sciences Reviews, 33(3), 135–140."],"tableRows":[["Brewed Coffee","90–120 mg","~0 mg","Fast Activation"],["Black Tea (Chai)","40–50 mg","5–15 mg","Sustained Focus"],["Green Tea","25–35 mg","5–20 mg","Calm Clarity"],["Matcha","60–80 mg","20–40 mg","Premium Focus"]],"studyModes":[{"body":"Coffee & Espresso for 8 AM lectures and quick wake-up resets.","emoji":"🔥","title":"Fast Boost"},{"body":"Authentic Chai for library marathons and steady 4-hour focus.","emoji":"🧠","title":"Deep Focus"},{"body":"Green Tea for late-night review without disrupting sleep.","emoji":"🌙","title":"Calm Clarity"}],"tableColumns":["Beverage","Caffeine (mg)","L-Theanine (mg)","Effect"],"tableHeading":"Typical Amounts Per 8 oz Cup","sourcesHeading":"Research & Sources","studyModeIntro":"College isn't one-speed. Neither is your brain. We categorize our menu by energy state to remove decision fatigue.","theaninePoints":[{"body":"Caffeine + L-Theanine improves task-switching and attention accuracy while reducing jitters.","icon":"⚖️","title":"The Power Combo"},{"body":"Tea provides a smoother energy curve, making it ideal for 3-4 hour study blocks.","icon":"⎳","title":"Cognitive Endurance"}],"theanineHeading":"The L-Theanine Advantage","studyModeHeading":"Choose Your Study Mode","theanineParagraph":"Unlike coffee, tea contains L-Theanine, an amino acid that promotes alpha brain wave activity. This creates a state of \"relaxed alertness\" or flow state."} },
   "meet-sipsense": { title: "Meet SipSense™", data: {"cta":{"label":"Try SipSense™","web_href":"/discover-drink?redirect_to=find-my-drink","app_action":"craft_custom_sip"},"tagline":"Where hospitality meets personalization.","sections":[{"blocks":[{"text":"Long before SipSense existed, there was Dasta.","type":"p"},{"text":"As Sandeep worked to bring his vision for Dasta to life, he was focused on creating something different—a café built around authentic chai, genuine hospitality, community, and discovery.","type":"p"},{"text":"Throughout that journey, many conversations took place with his family about the future of Dasta. His mother, who always encouraged him to think beyond conventional ideas, often asked thoughtful questions that challenged him to imagine what the café could become—not just what it was.","type":"p"},{"text":"One day, while discussing Dasta over coffee, the conversation turned to technology and how rapidly it was transforming industries around the world. Rather than asking how AI might replace people, his mom asked a much simpler question:","type":"p"},{"text":"\"Why can't we use AI in the café to create a better customer experience?\"","type":"strong"},{"text":"That single question changed everything.","type":"p"},{"text":"What began as a conversation between a mother and son quickly evolved into a vision for a new kind of café experience, where authentic hospitality and modern technology work together to serve people better.","type":"p"},{"type":"rich","segments":[{"bold":false,"text":"That vision became ","italic":false},{"bold":true,"text":"SipSense™","italic":false},{"bold":false,"text":".","italic":false}]}],"heading":"The Question That Started It All"},{"blocks":[{"text":"Most cafés offer menus.\nSipSense offers guidance.","type":"p"},{"text":"Rather than asking customers to sort through dozens of drinks, SipSense starts with something much more personal:","type":"p"},{"text":"How are you feeling today?","type":"strong"},{"text":"Whether you're looking for energy, comfort, focus, refreshment, or simply something new, SipSense takes your mood, cravings, and preferences and transforms them into a recommendation designed specifically for you.","type":"p"},{"text":"No two customers are exactly alike.\nYour recommendation shouldn't be either.","type":"p"}],"heading":"More Than a Recommendation Engine"},{"blocks":[{"text":"Step 1: Tell Us About Your Moment","type":"step"},{"text":"Are you studying for an exam?\nMeeting a friend?\nTaking a break between classes?\nLooking for something comforting on a cold day?\nLooking for something refreshing on a hot day?","type":"p"},{"text":"Simply tell SipSense how you're feeling or what you're craving.","type":"p"},{"text":"Step 2: Let SipSense Think","type":"step"},{"text":"SipSense carefully considers your preferences, flavor interests, and desired experience.","type":"p"},{"text":"Step 3: Discover Something New","type":"step"},{"text":"In just seconds, SipSense creates a personalized drink recommendation and food pairing designed specifically for you.","type":"p"},{"text":"Every recommendation is crafted with one goal:","type":"p"},{"text":"Helping you discover your perfect sip.","type":"strong"}],"heading":"How SipSense Works"},{"blocks":[{"text":"At Dasta, we believe great food and beverages are about more than ingredients.","type":"p"},{"text":"They're about traditions.\nThey're about culture.\nThey're about stories.\nThey're about people.","type":"p"},{"text":"Inspired by Dasta's philosophy of bringing the world to our customers, SipSense was built to help create moments of discovery.","type":"p"},{"text":"Today, that means personalized recommendations.","type":"p"},{"text":"Tomorrow, it means helping customers explore flavors, traditions, ingredients, and stories from around the world.","type":"p"},{"text":"Because every sip has a story waiting to be discovered.","type":"p"}],"heading":"Every Sip Has a Story"},{"blocks":[{"text":"One of the ideas that inspired Dasta was simple:","type":"p"},{"text":"What if a single café could help people experience flavors, traditions, and stories from around the world?","type":"p"},{"text":"What if a student taking a break from studying could discover a flavor inspired by another culture?","type":"p"},{"text":"What if a simple cup of chai or coffee could spark curiosity, conversation, or connection?","type":"p"},{"text":"SipSense helps make that vision possible.","type":"p"},{"text":"Not by replacing hospitality. But by enhancing it.","type":"p"},{"text":"One recommendation at a time.","type":"p"}],"heading":"A World From Your Chair"},{"blocks":[{"text":"The purpose of SipSense has never been technology for technology's sake.","type":"p"},{"text":"The purpose is creating a better customer experience.","type":"p"},{"text":"Helping someone discover a new favorite drink.","type":"p"},{"text":"Helping a student find the right study companion.","type":"p"},{"text":"Helping a customer feel understood.","type":"p"},{"text":"Helping make every visit a little more personal.","type":"p"},{"text":"Because great hospitality has always been about people.","type":"p"},{"text":"SipSense simply gives us a new way to serve them.","type":"p"}],"heading":"Built Around People"},{"blocks":[{"type":"rich","segments":[{"bold":false,"text":"SipSense started with a simple idea: understand what you're in the mood for. Today, it helps you discover new favorites inspired by ","italic":false},{"bold":true,"text":"Campus Rhythm","italic":true},{"bold":false,"text":", guided by ","italic":false},{"bold":true,"text":"Discovery Engines","italic":true},{"bold":false,"text":", and enhanced by the pulse of ","italic":false},{"bold":false,"text":"what's happening around you. (","italic":true},{"bold":true,"text":"Local Pulse Engine","italic":true},{"bold":false,"text":")","italic":true}]},{"text":"Future innovations will continue to make recommendations more personal, more meaningful, and more connected to the stories, moments, and discoveries that make every visit unique.","type":"p"},{"text":"As Dasta grows, SipSense will grow alongside it—continuing to blend hospitality, discovery, and innovation in ways that help create experiences worth remembering.","type":"p"}],"heading":"Looking Ahead"},{"blocks":[{"text":"Try SipSense™","type":"strong"},{"text":"Tell us your mood.\nTell us your craving.\nSipSense does the rest.","type":"p"},{"text":"Your sip. Your story.","type":"em"},{"text":"Your next favorite sip may be one recommendation away.","type":"em"}],"heading":"Ready to Discover Your Next Sip?"}]} },
-  "discover-dasta-rewards": { title: "Discover Dasta Rewards", data: {"tiers":[{"name":"Fresh Leaf","intro":"Founder Journey Starts here:","perks":["Birthday Drink","Early access to seasonal drinks","Priority invitations to special events"],"highlight":"You're helping Dasta take root"},{"name":"Silver Leaf","intro":"Everything in Fresh Leaf plus:","perks":["Vote on future drinks","Founder Polls","Double-Leaf Days"],"highlight":"You're helping Dasta grow"},{"name":"Golden Leaf","intro":"Everything in Silver Leaf plus:","perks":["Secret Menu Access","Seasonal drink previews","Tasting event Invitations"],"highlight":"Helping shape the future of Dasta"},{"name":"Evergreen Leaf","intro":"Everything in Gold Leaf plus:","perks":["Status for Life","Wall Recognition","First access to major launches"],"highlight":"A permanent place in Dasta's story"}],"heading":"Dasta Rewards & Founders Circle","impactRows":[{"field":"leaves_collected","label":"Lifetime Leaves Earned:"},{"field":"free_drinks_redeemed","label":"Free Drinks Claimed"},{"field":"trees_to_be_planted","label":"Saplings to be Planted"},{"field":"founder_members","label":"Founder Members"}],"subheading":"Your Dasta Plant grows leaves for rewards, and\nYour grove with Dasta grows saplings !!","trustIntro":"Your payment information deserves the highest level of protection. That's why Dasta Account is powered by Stripe, one of the world's most trusted financial technology platforms.","trustTitle":"Your Trust Matters","circleIntro":"Collect Leaves. Earn free drinks. Grow your grove.","circleTitle":"Dasta Rewards","closingBody":"Because loyalty should never expire.","footerBanner":"Dasta Account : Protected by Stripe. Trusted by millions. Built for Dasta.","trustBullets":["Bank-level encryption","Secure payment processing","Dasta never stores your banking credentials","Trusted by millions of customers worldwide"],"circleBullets":["Earn leaves with eligible purchases","Redeam leaves for free drinks","Grow lifetime saplings with Dasta Rewards","Your leaves never expire","Payments protected by Stripe"],"closingItalic":"Leaves always stay green at Dasta.","impactApiPath":"/sip/community-impact","tiersImageAlt":"Four leaves in green, silver, gold, and dark green with labels showing leaves and saplings count.","tiersImageUrl":"https://cdn.prod.website-files.com/69dece9688dac5181962f293/6a374cf6235f0819a1b201c3_0ede7f2c0fd38d43bf612746399d804b_Fouders%20Tier.png","dastaCardIntro":"Load funds once and pay seamlessly in-store or online while earning Leaves with every purchase.","dastaCardTitle":"Dasta Card","memberBenefits":[{"body":"Earn rewards automatically as your plant grows.","title":"Free Drinks"},{"body":"Pay quickly using your Dasta Account.","title":"Faster Checkout"},{"body":"Connect with SipSense to create personalized drink recommendations and member experiences.","title":"Personalized Experiences"},{"body":"Members will receive access to special offers, bonus Leaf events, and seasonal rewards.","title":"Exclusive Promotions"}],"dastaCardFooter":"Every purchase made through Dasta Rewards helps your plant grow.","howItWorksSteps":[{"body":"Create your free account in minutes.","title":"Join Dasta Rewards"},{"body":"Every eligible Dasta purchase adds Leaves to your account.","title":"Earn Leaves"},{"body":"Use your leaves for free drinks.","title":"Enjoy Rewards"},{"body":"Your lifetime leaves help Dasta plant saplings every spring season. (50 leaves per sapling)","title":"Grow your grove"}],"howItWorksTitle":"How It Works :","impactCardTitle":"🌍 Dasta Community Impact","whyFounderIntro":"Most rewards programs recognize purchases. Founders Circle recognizes people.","whyFounderTitle":"Why Become a Founder?","cardPaymentsBody":"Dasta Account has an option to save their preferred payment method (up to 3 cards) and enjoy the same rewards and benefits. One of your saved cards could be set as the default card for payment and auto-reload Dasta Card.\n\nBank level security with all personal information stored at Stripe.","dastaCardBullets":["Pay using a secure QR code","Track spending history","Access member rewards automatically"],"cardPaymentsTitle":"Credit or Debit Card payments","foundersCircleIntro":"Some leaves become free drinks. Every ten leaves become a real sapling. Together, we're growing something much bigger.\n\nFounders Circle recognizes the guests who help Dasta grow through every visit, every recommendation, and every shared experience.","foundersCircleTitle":"Founders Circle","growingTogetherBody":"At Dasta, leaves mean more than rewards. While 10 leaves unlock a free drink, they also contribute to something bigger. Every 50 leaves earned by our community, Dasta commits to planting one sapling each year. As our community grows, so does our impact.\n\nTogether, we're transforming everyday ritual into a greener future.","memberBenefitsTitle":"Member Benefits","growingTogetherTitle":"Growing Together","leavesNeverExpireNote":"Leaves never expire."} },
-  "privacy-policy": { title: "Dasta Privacy Policy", data: {"sections":[{"body":"Last Updated: September 21, 2026","heading":"Effective Date: November 20, 2026"},{"body":"This Privacy Policy explains how Dasta LLC (\"Dasta,\" \"we,\" \"us,\" or \"our\") collects, uses, discloses, stores, and protects information when you use the Dasta mobile application, DastaCafe.com, SipSense, Dasta Rewards, Dasta Card, mobile ordering, gifting, gift cards, and other Dasta products, features, and services (collectively, the \"Dasta Services\"). It also explains the choices and rights available to you regarding your information.\n\nThis Privacy Policy is intended to describe Dasta's current privacy practices for the Dasta Services. Some features are optional, and the information Dasta processes depends on the features you choose to use, the permissions you grant, and the services available at a particular time or location.","heading":""},{"body":"Depending on how you use the Dasta Services, we may collect or process the following categories of information.","heading":"1. Information We Collect"},{"body":"We may collect your name, email address, telephone number, Dasta customer or account identifier, birthday month and day when you choose to provide it, and other contact or profile information you provide. Certain profile fields are optional and are used only for the purposes described when collected.","heading":"Account and Contact Information"},{"body":"We process information needed to create, authenticate, secure, and manage your account. This may include email or SMS verification information, authentication and session identifiers, trusted-device information, and information associated with Sign in with Apple or Google Sign-In when you choose those methods. Apple and Google determine what account information they provide to Dasta based on their services and your choices.","heading":"Authentication and Account Security Information"},{"body":"We may collect information about orders, purchased items, drink or food customizations, pickup details, transaction status, purchase history, refunds, rewards earned or redeemed, gifts, gift cards, Dasta Card transactions, and related activity necessary to provide the Dasta Services.","heading":"Order, Purchase, and Transaction Information"},{"body":"Eligible card payments are processed by Stripe or another payment processor identified at the time of payment. Card credentials may be entered directly into interfaces provided by the payment processor. Dasta may receive limited payment-related information such as payment status, transaction identifiers, payment method type, and limited card descriptors made available by the processor. Dasta does not receive or store complete payment-card numbers or card security codes when those credentials are processed directly by the payment processor.","heading":"Payment Information"},{"body":"If you participate in Dasta Rewards, we process information such as leaves earned and redeemed, rewards, program status, and related activity. If you use Dasta Card, we process Dasta Card identifiers, balances, reload activity, transaction history, Auto Reload settings, and information needed to operate and secure the service. If you purchase or send a gift, we may process purchaser information, recipient information you provide, gift details, delivery information, redemption status, and associated transaction information.","heading":"Dasta Rewards, Dasta Card, and Gift Information"},{"body":"When you use SipSense, we may process information you provide about beverage preferences, cravings, mood, desired flavors, dietary preferences, customizations, previous selections, text prompts, voice input or transcriptions, and other information you choose to provide. We use this information to provide and improve personalized beverage or food recommendations and related Dasta experiences.\n\nSipSense recommendations are intended for discovery and convenience and should not be relied upon as a substitute for verifying ingredients, allergens, dietary restrictions, or other individual requirements directly with Dasta.","heading":"SipSense and Personalization Information"},{"body":"When you choose to use voice-enabled features, the Dasta mobile application or your browser on DastaCafe.com may access your device or browser microphone with your permission to recognize spoken navigation shortcuts, receive SipSense input, or perform another voice-enabled action you request. Depending on the feature, device, browser, operating system, language, and availability, speech may be processed through operating-system or browser speech-recognition services or transmitted securely to Dasta systems for transcription and processing. Dasta does not retain raw voice recordings on Dasta-controlled infrastructure after the applicable voice request has been processed. Where speech recognition is performed by an operating-system, browser, or platform service, that provider may process voice or speech data in accordance with its own privacy terms and device or browser settings. Dasta may process the resulting transcription as described in this Privacy Policy.","heading":"Voice and Speech Information"},{"body":"When you choose a location-based feature and grant permission, the Dasta mobile application or your browser on DastaCafe.com may access your device's or browser's foreground location to identify a nearby Dasta café, provide directions, or support another location-related feature you request. Dasta does not request background location for the current mobile-app or website functionality. You may decline or revoke location permission through your device or browser settings.","heading":"Location Information"},{"body":"We may process device type, operating system, app version, device or session identifiers, authentication/session information, IP address, diagnostic information, error information, and other technical information reasonably necessary to operate, secure, troubleshoot, and improve the Dasta Services. Information processed solely on your device or ephemerally may be treated differently under applicable platform disclosure rules.","heading":"Device, Session, and Technical Information"},{"body":"We may collect communications you send to Dasta, including customer-support requests, feedback, survey responses, email or SMS interactions, notification preferences, and other information you choose to submit.","heading":"Communications, Feedback, and Support"},{"body":"DastaCafe.com uses cookies and similar technologies that are necessary for the website to function, such as maintaining your session, remembering preferences, and protecting the security of the site. Consistent with Section 3, Dasta does not use cookies or similar technologies to sell personal information or to engage in cross-context behavioral advertising.","heading":"Cookies and Similar Technologies (DastaCafe.com)"},{"body":"We may use information described in this Privacy Policy to:\n• provide, operate, maintain, and improve the Dasta Services;\n• create, authenticate, secure, and manage Dasta accounts and trusted sessions;\n• process orders, payments, refunds, Dasta Card activity, gift cards, gifts, and related transactions;\n• operate Dasta Rewards, calculate and redeem leaves and rewards, and provide eligible program benefits;\n• generate and personalize SipSense recommendations and saved preferences;\n• process voice commands and transcriptions when you choose to use voice-enabled features;\n• identify nearby Dasta cafés and provide location-related functionality when you request it;\n• send transactional, account-security, order, reward, gift, and service communications;\n• send marketing communications where permitted and consistent with your choices;\n• provide customer support and respond to feedback or requests;\n• detect, investigate, and prevent fraud, abuse, unauthorized access, security incidents, and technical problems;\n• analyze and improve the performance, reliability, usability, and security of the Dasta Services, to the extent applicable; and\n• comply with legal, tax, accounting, regulatory, dispute-resolution, and enforcement obligations.","heading":"2. How We Use Information"},{"body":"We do not disclose personal information except as described in this Privacy Policy, as directed by you, or as otherwise permitted or required by law.","heading":"3. How We Disclose Information"},{"body":"We may disclose information to service providers that process information on our behalf or provide infrastructure and functionality needed to operate the Dasta Services. Depending on the feature used, these providers may include payment processors such as Stripe; cloud, hosting, authentication, communications, and security providers; Apple and Google platform or identity services; Expo-related application infrastructure where used; mapping or location services; and other vendors that support Dasta operations.\n\nDasta requires service providers that receive personal information from Dasta to protect that information consistent with their contractual obligations, applicable law, and the protections described in this Privacy Policy, as appropriate to the services they provide.","heading":"Service Providers"},{"body":"Certain SipSense and voice features use automated processing, speech recognition, transcription, or artificial-intelligence technologies to respond to customer requests and generate personalized recommendations. SipSense may consider information voluntarily provided by the customer, such as preferences, cravings, mood, desired flavors, dietary preferences, customizations, and the context of a particular request.\n\nDasta does not sell or disclose customer personal information to third-party artificial-intelligence providers for their independent use, advertising, or model training. Where Dasta uses third-party technology providers to process information on Dasta's behalf, those providers may process only the information necessary to provide the applicable service, subject to applicable contractual, legal, and platform requirements.","heading":"Artificial Intelligence and Speech Processing"},{"body":"We may disclose information when we reasonably believe disclosure is necessary to comply with law or legal process, enforce our agreements, investigate fraud or security incidents, protect the rights, property, or safety of Dasta, our customers, or others, or in connection with a merger, financing, acquisition, reorganization, sale of assets, or similar corporate transaction, subject to applicable law.","heading":"Legal, Safety, and Corporate Purposes"},{"body":"Dasta does not sell personal information and does not share personal information for cross-context behavioral advertising or use customer personal information for third-party targeted advertising.","heading":"Sale and Targeted Advertising"},{"body":"The Dasta mobile application and DastaCafe.com request device or browser permissions only when they are relevant to an available feature. You may decline optional permissions, although the related feature may then be unavailable.\n• Location: manage foreground location permission in your iOS or Android device settings, or through your browser settings when using DastaCafe.com.\n• Microphone and Speech Recognition: manage microphone and speech-recognition permissions in your device or browser settings. Voice features are optional.\n• Notifications and Communications: manage eligible communication preferences within Dasta and through your device, browser, email, or SMS settings, as applicable. If push notifications are enabled in the version of the Dasta app you use, you may manage push-notification permission through your device settings. Certain transactional or security communications may still be sent through available channels when necessary to provide the service.\n• Marketing Email and SMS: use the applicable unsubscribe or opt-out mechanism and account preferences. Transactional or security communications may not be subject to marketing opt-out choices.\n• Profile Information: update eligible account information through the Dasta Services or contact Dasta.\n• Auto Reload: change or disable Auto Reload through Dasta Card settings; changes apply to future reloads.\n• Cookies: manage cookies and similar technologies through your browser settings. Dasta does not currently sell personal information or share it for cross-context behavioral advertising, so opt-out mechanisms for those practices, including recognition of Global Privacy Control signals, are not applicable at this time; if that changes, Dasta will provide an appropriate mechanism as required by law.\n\nWhere Dasta relies on consent to process information, you may withdraw that consent through the applicable settings or contact method. Withdrawal does not affect processing that was lawful before withdrawal.","heading":"4. Permissions and Your Choices"},{"body":"Dasta retains personal information only for as long as reasonably necessary for the purposes described in this Privacy Policy, including to provide the Dasta Services, maintain accounts and transaction records, meet legal, tax, accounting, and regulatory requirements, prevent fraud, resolve disputes, and enforce agreements. Retention periods vary based on the type of information, the feature involved, and applicable obligations.\n\nWhen information is no longer reasonably required, Dasta will delete, de-identify, aggregate, or otherwise dispose of it as appropriate. Some transaction, accounting, security, fraud-prevention, or legal records may be retained after account deletion when retention is required or permitted by law.\n\nRaw voice recordings processed by Dasta are not retained by Dasta after the applicable voice request has been processed. SipSense inputs, transcriptions, preferences, and recommendation history may be retained when necessary to provide saved preferences, personalization, account functionality, security, or service improvement, subject to the retention principles described above.","heading":"5. Data Retention"},{"body":"You may initiate deletion of your Dasta account through the account settings available on DastaCafe.com or from within the Dasta mobile application by opening your account menu and selecting Delete My Account.\n\nIf you no longer have access to your Dasta account or the Dasta mobile application, you may request deletion of your Dasta account and associated personal information by emailing privacy@dastacafe.com. Please submit the request using the email address associated with your Dasta account when possible. Dasta may take reasonable steps to verify your identity before completing the request.\n\nWhen an account-deletion request is completed, Dasta deletes or de-identifies personal information associated with the account except information that Dasta must or is permitted to retain for legitimate purposes such as legal, tax, accounting, security, fraud-prevention, regulatory, or dispute-resolution obligations.\n\nAccount deletion may affect unused rewards, saved preferences, gifts, and other account-linked benefits. Paid stored value, gift cards, and transaction records will be handled in accordance with applicable law and the Dasta Terms of Use.","heading":"6. Account and Data Deletion"},{"body":"Dasta uses administrative, technical, and organizational safeguards designed to protect personal information against unauthorized access, loss, misuse, alteration, or disclosure. Dasta uses secure network communications for its production services and relies on specialized service providers for certain functions such as payment processing. However, no method of electronic transmission or storage can guarantee absolute security.","heading":"7. Security"},{"body":"The Dasta Services are not directed to children under 13, and Dasta does not knowingly collect personal information from children under 13 without appropriate authorization. If Dasta learns that personal information from a child has been collected in violation of applicable law, Dasta will take appropriate steps to delete it.\n\nUsers who are minors in their jurisdiction should use the Dasta Services only with the involvement and consent required by applicable law and the Dasta Terms of Use. Dasta does not intend to use children's personal information for targeted advertising or profiling.","heading":"8. Children's Privacy"},{"body":"Depending on where you live and subject to applicable law and exemptions, you may have rights regarding personal information, which may include rights to request access, correction, deletion, or a copy of certain information, and rights relating to certain sales, sharing, or targeted advertising practices. Dasta will not discriminate against you for exercising rights provided by applicable law.\n\nTo submit a privacy request, contact Dasta using the information in Section 14. Dasta may need to verify your identity and may request information reasonably necessary to process the request. Authorized agents may submit requests where permitted by law and subject to appropriate verification.\n\nDepending on your state of residence, these rights may include the right to:\n• know or access the personal information Dasta has collected about you;\n• correct inaccurate personal information;\n• delete personal information, subject to certain exceptions;\n• obtain a copy of your personal information in a portable format; and\n• opt out of the sale or sharing of personal information, targeted advertising, and, where applicable, certain uses of sensitive personal information.\n\nAs described in Section 3, Dasta does not sell personal information and does not share personal information for cross-context behavioral advertising. Where Dasta processes any sensitive personal information, such as precise location or voice input, Dasta limits that processing to the purposes described in this Privacy Policy and does not use it to infer characteristics about you.\n\nIf Dasta declines to act on a privacy request, you may have the right to appeal that decision under applicable state law. To appeal, contact Dasta using the information in Section 14 and reference your original request; Dasta will respond to the appeal within the time required by applicable law.","heading":"9. U.S. State Privacy Rights"},{"body":"Dasta is based in the United States, and the Dasta Services are primarily intended for customers in the United States. If you access the Dasta Services from outside the United States, information may be processed in the United States and other locations where Dasta or its service providers operate, subject to applicable law. Availability of the Dasta mobile application through an app store in a particular jurisdiction does not necessarily mean that all Dasta Services are offered or available in that jurisdiction.","heading":"10. International Use"},{"body":"The Dasta Services may interact with third-party services, including Stripe, Apple, Google, mapping services, authentication services, and other providers. Those providers may process information under their own privacy policies when you interact directly with their services. Dasta is not responsible for the privacy practices of independent third-party websites or services that are not acting as Dasta's service providers.\n\nDasta's use of a service provider does not authorize that provider to use Dasta customer information for unrelated purposes beyond what is permitted by applicable contracts, law, and platform requirements.","heading":"11. Third-Party Services and Links"},{"body":"Dasta distributes its mobile application through platforms that require separate privacy disclosures. Dasta maintains App Store privacy information for Apple and a Data Safety section for Google Play. Those disclosures are intended to reflect the data practices of the production version of the Dasta mobile application and should be read together with this Privacy Policy.\n\nDasta is responsible for keeping those platform disclosures accurate as the app changes, including disclosures relating to account/contact information, identifiers, purchase history, user content, location, voice or audio information where applicable, and data processed by third-party SDKs or service providers.\n\nApple and Google may independently collect information when you use their devices, app stores, operating systems, authentication services, speech-recognition services, or other platform features. Their processing is governed by their own privacy policies and terms.","heading":"12. Apple App Store and Google Play Privacy Disclosures"},{"body":"Dasta may update this Privacy Policy to reflect changes to the Dasta Services, data practices, technology, legal requirements, or platform requirements. Dasta will update the \"Last Updated\" date above and will provide additional notice when required by applicable law. Material changes will apply prospectively as required by law.","heading":"13. Changes to This Privacy Policy"},{"body":"Dasta LLC\n151 West Gorham Street\nMadison, WI 53703\nPrivacy inquiries: privacy@dastacafe.com\nCustomer support: support@dastacafe.com\n\nQuestions, complaints, requests to exercise privacy rights, or concerns about this Privacy Policy may be submitted using the contact information above.","heading":"14. Contact Us"}]} },
-  "terms-of-use": { title: "Dasta Terms of Use", data: {"sections":[{"body":"Last Updated: September 21, 2026","heading":"Effective Date: November 20, 2026"},{"body":"These Terms of Use (\"Terms\") govern your access to and use of the Dasta mobile application, DastaCafe.com, SipSense, Dasta Account, Dasta Card, mobile ordering, gifting, gift cards, and other products, features, and services provided by Dasta (collectively, the \"Dasta Services\").\n\nBy accessing or using the Dasta Services, creating an account, placing an order, or participating in Dasta programs, you agree to these Terms and our Privacy Policy. If you do not agree to these Terms, you should not use the Dasta Services.","heading":"1. Acceptance of Terms"},{"body":"Certain Dasta Services may be used without creating an account. Other features, including My Circles, Dasta Card, saved preferences, gifting, and certain personalized services, may require a Dasta account.\n\nYou must be at least 13 years old to create a Dasta account. If you are a minor in your jurisdiction, you may use the Dasta Services, including Dasta Card and gift cards, only with the involvement and consent of a parent or legal guardian who holds the account and payment method. By creating an account, you represent that you meet these requirements.\n\nYou agree to provide accurate information and to keep your account information current. You are responsible for maintaining the security of your account and for activity occurring through your account.\n\nDasta may support authentication through email, phone number, Sign in with Apple, Google Sign-In, or other authentication methods made available from time to time.\n\nIf you believe your account has been accessed without authorization, contact Dasta promptly at support@dastacafe.com.","heading":"2. Eligibility and Accounts"},{"body":"Dasta allows customers to order beverages, food, and other eligible products for pickup or other available fulfillment methods.\n\nPrices, product availability, ingredients, customization options, taxes, fees, and promotions may vary by location and may change without notice. An order is not final until it has been accepted by Dasta.\n\nDasta may cancel or modify an order when an item is unavailable, an order cannot reasonably be fulfilled, a pricing or technical error occurs, or other circumstances prevent fulfillment. If Dasta cancels an order after payment has been captured, Dasta will provide an appropriate refund or other remedy consistent with Section 17 (Refunds and Cancellations) and applicable law.","heading":"3. Mobile Ordering and Purchases"},{"body":"Payments made through the Dasta mobile application may be processed by Stripe or another payment processor identified at the time of purchase. Payment information provided for card transactions is processed by the applicable payment processor in accordance with its terms and privacy practices.\n\nDasta does not store complete payment-card numbers or card security codes on its own systems when those credentials are processed directly by our payment processor.\n\nBy submitting a payment method, you represent that you are authorized to use that payment method and authorize the applicable charges associated with your transaction.","heading":"4. Payments"},{"body":"Dasta Card is a stored-value feature that allows eligible customers to load funds and use the available balance for qualifying purchases from Dasta.\n\nFunds loaded to a Dasta Card are not a bank deposit, checking account, savings account, credit card, or general-purpose payment account and may be used only as permitted by Dasta.\n\nDasta Card balances are subject to applicable law and any additional terms presented when funds are loaded or used. Except where required by law, Dasta Card value is intended for purchases from Dasta and is not redeemable for cash. Nothing in these Terms limits rights that cannot lawfully be waived, including rights that may apply to stored value, unclaimed property, or refunds in a particular jurisdiction.\n\nAuto Reload. If you enable Auto Reload, you authorize Dasta and its payment processor to automatically charge your selected payment method according to the reload threshold and reload amount you select.\n\nYou may change or disable Auto Reload through your Dasta account settings. Disabling Auto Reload will apply to future automatic reloads and will not reverse transactions that have already been processed.\n\nAuto reload will be paused for 24h if there are two consecutive reloads within a span of 10 minutes. This specific feature is added to protect any fraud activity. During reload pause, the customer could use other option \"add money\" feature to load the card.","heading":"5. Dasta Card"},{"body":"Dasta may allow customers to purchase gift cards or send eligible beverages, food, rewards, or other gifts to another person.\n\nGift cards and gifts may be subject to redemption requirements, expiration restrictions where permitted by law, location restrictions, promotional conditions, and other terms displayed at the time of purchase.\n\nThe purchaser is responsible for providing accurate recipient information. Dasta is not responsible for delivery failures resulting from inaccurate recipient information supplied by the purchaser, except as required by applicable law.\n\nGift card purchases are non-refundable except as required by applicable law or as described in Section 17 (Refunds and Cancellations). Any expiration, inactivity, redemption, or cash-redemption terms applicable to a Dasta gift card will be administered in accordance with applicable law and any terms disclosed at purchase.","heading":"6. Gift Cards and Gifting"},{"body":"Dasta Rewards is Dasta's customer loyalty and rewards program. Eligible customers may earn leaves, rewards, benefits, promotional offers, status, or other program benefits through qualifying activity.\n\nLeaves and other Dasta Rewards benefits have no cash value unless expressly stated otherwise and may not be transferred, sold, or exchanged for cash except where required by law.\n\nDasta may establish or modify earning rules, redemption requirements, reward availability, promotional offers, program tiers, and other program terms. Material changes will be communicated as required by applicable law.","heading":"7. Dasta Rewards"},{"body":"SipSense is Dasta's personalized beverage discovery and recommendation experience. SipSense may use information you provide, including preferences, cravings, mood, customizations, text or voice input, prior selections, and other relevant information, to generate beverage and food recommendations.\n\nSipSense recommendations are generated for convenience and discovery. Recommendations may not always reflect every ingredient, dietary preference, allergy, nutritional requirement, or other individual consideration.\n\nCustomers with food allergies, intolerances, medical dietary restrictions, or other ingredient concerns should verify ingredients directly with Dasta before ordering and should not rely solely on a SipSense recommendation. See Section 19 (Disclaimer of Warranties) for additional information.","heading":"8. SipSense"},{"body":"Dasta may provide optional voice-enabled features that allow you to navigate the app, enter SipSense requests, use voice-activated shortcuts, or interact with certain Dasta Services using speech.\n\nVoice recognition may occasionally misunderstand or incorrectly transcribe spoken input. You are responsible for reviewing order details, selections, and other important information -- including anything added to your cart or submitted for purchase through a voice command -- before confirming a transaction.\n\nUse of voice features may involve microphone access and speech processing as described in the Dasta Privacy Policy. You can manage microphone and speech-recognition permissions through your device settings.","heading":"9. Voice Features"},{"body":"With your permission, the Dasta mobile application may use your device's location to identify nearby Dasta cafés, provide directions, or enable other location-related features.\n\nLocation access is optional. You may decline or disable location access through your device settings, although certain location-based features may then be unavailable.\n\nDasta's collection and use of location information is described in the Dasta Privacy Policy. The mobile application is designed to request location access only for location-related features made available to you.","heading":"10. Location Services"},{"body":"Depending on your settings and permissions, Dasta may communicate with you through email, SMS/text messages, in-app messages, or push notifications regarding orders, account activity, rewards, gifts, promotions, and other Dasta Services.\n\nYou may manage eligible communication preferences through your account, device settings, or applicable unsubscribe mechanisms. Certain transactional or account-security communications may still be sent when necessary to provide the Dasta Services.","heading":"11. Notifications and Communications"},{"body":"If you provide suggestions, comments, feedback, reviews, ideas, or other submissions regarding Dasta or the Dasta Services, you grant Dasta permission to use that feedback to operate, improve, and develop its products and services, subject to applicable law and our Privacy Policy.","heading":"12. Feedback and User Submissions"},{"body":"The Dasta Services and their associated software, designs, interfaces, branding, text, graphics, functionality, recommendations, and other content are owned by or licensed to Dasta and are protected by applicable intellectual-property laws.\n\nDasta, SipSense, Dasta Rewards, Dasta Card, associated logos, and other Dasta marks may be trademarks or service marks of Dasta.\n\nCertain SipSense technology and functionality are the subject of a pending U.S. patent application. \"Patent pending\" status does not imply that a patent has been granted but the application is under review by USPTO.","heading":"13. Intellectual Property"},{"body":"If you engage in any of the following actions, Dasta may suspend or terminate your access to the Dasta Services, pursue all available civil remedies, and refer the matter to law enforcement or other appropriate authorities where warranted:\n• fraud;\n• unauthorized account access;\n• abuse of promotions/rewards;\n• manipulating Dasta Account balances;\n• reverse engineering where legally permissible;\n• automated scraping;\n• interfering with the app/API;\n• attempting to access another customer's data;\n• fraudulent payments, gift cards, or Dasta Card activity.","heading":"14. Prohibited Uses"},{"body":"Dasta may restrict or suspend access when reasonably necessary to protect customers, investigate suspected fraud or misuse, comply with law, protect Dasta systems, or enforce these Terms.\n\nCustomers may stop using the Dasta Services at any time and may request deletion of their Dasta account through the account settings available in the mobile application. Dasta may also provide an external account-deletion request method for users who no longer have access to the application.","heading":"15. Account Suspension and Termination"},{"body":"You may initiate deletion of your Dasta account from within the Dasta mobile application. Account deletion permanently deletes or de-identifies associated personal information except information Dasta must retain for legitimate purposes such as legal, tax, accounting, fraud-prevention, dispute-resolution, or regulatory obligations.\n\nBefore deletion, Dasta may inform you of outstanding balances, unredeemed gifts, rewards, transactions, or other account items that may be affected by deletion. Deleting an account may result in the loss of unused rewards, saved preferences, and other account-linked benefits, subject to applicable law and any separate rights associated with paid stored value or gift cards. Dasta may require reasonable steps to verify your identity before completing a deletion request. Additional information about deletion, retention, and your privacy rights is provided in the Dasta Privacy Policy.","heading":"16. Account Deletion"},{"body":"Because Dasta prepares food and beverages, including custom SipSense creations, to order, all sales are generally final once an order has been accepted and preparation has begun. The following exceptions apply:\n• Dasta Error. If Dasta is unable to fulfill an order, made an error in preparing it, or a pricing or technical error occurred, Dasta will issue a refund to the Dasta card found on customer's Dasta Account.\n• Customer-Initiated Cancellation. You may cancel an order before Dasta has begun preparing it or in case of My Circles group order, you may cancel the order until cutoff time listed on the group order. Once preparation has begun -- including once a custom SipSense drink has been crafted into a build ticket -- the order can no longer be canceled for a refund except as described above.\n• Gift Cards. Gift card purchases are non-refundable except as required by applicable law.\n• Dasta Card. Funds loaded to a Dasta Card are non-refundable except as required by applicable law or as described in Section 5 (Dasta Card).\n• Rewards and Redemptions. If an order that would have earned leaves, rewards, or a free-drink redemption is canceled or refunded, any leaves, rewards, or redemption associated with that order may be reversed or forfeited.\n\nIn store refunds are typically issued to the original payment method as long as the original receipt is presented during the return. Anywhere permitted by law and agreed to by the customer, Dasta may offer another form of credit or remedy. Processing times vary by payment provider and financial institution.","heading":"17. Refunds and Cancellations"},{"body":"The Dasta Services may interoperate with or rely on third-party services, including payment processors, identity providers, device-platform services, mapping or location services, communications providers, and other technology providers. Your use of a third-party service may also be governed by that provider's terms and privacy practices. Dasta is not responsible for third-party services except to the extent required by applicable law or expressly stated in these Terms.","heading":"18. Third-Party Services"},{"body":"TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE DASTA SERVICES -- INCLUDING THE DASTA MOBILE APPLICATION, DASTACAFE.COM, SIPSENSE, DASTA REWARDS, DASTA CARD, AND ALL RELATED FEATURES AND CONTENT -- ARE PROVIDED \"AS IS\" AND \"AS AVAILABLE,\" WITHOUT WARRANTIES OF ANY KIND, WHETHER EXPRESS, IMPLIED, OR STATUTORY, INCLUDING BUT NOT LIMITED TO THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT.\n\nDasta does not warrant that the Dasta Services will be uninterrupted, secure, or error-free, that defects will be corrected, or that SipSense recommendations, voice-recognition results, or any other automatically generated content will be accurate, complete, or suitable for your individual dietary, allergy, or health needs. As described in Section 8 (SipSense), you should verify ingredients directly with Dasta rather than relying solely on a SipSense recommendation.\n\nNothing in this section is intended to limit any warranty that cannot be excluded under applicable law, including any statutory rights you may have as a consumer, or any warranty Dasta separately provides regarding the food and beverage products themselves under applicable food-safety law.","heading":"19. Disclaimer of Warranties"},{"body":"TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, DASTA AND ITS OFFICERS, EMPLOYEES, AND AGENTS WILL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES, OR ANY LOSS OF PROFITS, REVENUE, DATA, OR GOODWILL, ARISING FROM OR RELATED TO YOUR USE OF THE DASTA SERVICES, EVEN IF DASTA HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.\n\nTO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, DASTA'S TOTAL LIABILITY TO YOU FOR ANY CLAIM ARISING FROM OR RELATED TO THE DASTA SERVICES WILL NOT EXCEED THE GREATER OF (A) THE AMOUNT YOU PAID TO DASTA THROUGH THE DASTA SERVICES IN THE ONE HUNDRED EIGHTY (180) DAYS BEFORE THE EVENT GIVING RISE TO THE CLAIM, OR (B) FIFTY DOLLARS ($50).\n\nSome jurisdictions do not allow the exclusion or limitation of certain damages, so some or all of the exclusions and limitations in this section may not apply to you.","heading":"20. Limitation of Liability"},{"body":"To the maximum extent permitted by applicable law, you agree to indemnify, defend, and hold harmless Dasta, its officers, employees, and agents from and against any claims, damages, losses, liabilities, costs, and expenses (including reasonable attorneys' fees) arising from or related to: (a) your use or misuse of the Dasta Services; (b) your violation of these Terms; (c) your violation of any applicable law or the rights of a third party; or (d) any content, information, or payment method you submit through the Dasta Services.\n\nDasta reserves the right, at its own expense, to assume the exclusive defense and control of any matter otherwise subject to indemnification by you, in which case you agree to cooperate with Dasta's defense of that claim.","heading":"21. Indemnification"},{"body":"These Terms and any dispute arising from or related to the Dasta Services are governed by the laws of the State of Wisconsin, without regard to its conflict-of-laws principles, except to the extent superseded by applicable federal law.\n\nBefore initiating arbitration, the party asserting a dispute will first provide the other party with written notice describing the dispute and requested relief and allow a reasonable opportunity to resolve the matter informally. If the dispute is not resolved informally, any dispute, claim, or controversy arising from or relating to these Terms or the Dasta Services will be resolved by binding arbitration on an individual basis, rather than in court, except that either party may bring an individual action in small claims court where eligible. YOU AND DASTA EACH WAIVE THE RIGHT TO A JURY TRIAL AND TO PARTICIPATE IN A CLASS ACTION, CLASS ARBITRATION, OR REPRESENTATIVE ACTION, TO THE EXTENT PERMITTED BY APPLICABLE LAW.\n\nIf any part of this arbitration agreement is found unenforceable, that part will be severed and the remainder will remain in effect, except that if the class-action waiver is found unenforceable, the entire arbitration agreement will be unenforceable.","heading":"22. Governing Law and Dispute Resolution"},{"body":"Dasta may update these Terms from time to time. If Dasta makes a material change, Dasta will provide notice through the Dasta mobile application, by email, or by another reasonable method before the change takes effect. Your continued use of the Dasta Services after a change becomes effective constitutes acceptance of the updated Terms.","heading":"23. Changes to These Terms"},{"body":"If any provision of these Terms is found to be unenforceable or invalid, that provision will be limited or eliminated to the minimum extent necessary, and the remaining provisions will remain in full force and effect.","heading":"24. Severability"},{"body":"These Terms, together with the Privacy Policy and any additional terms presented for a specific Dasta Service (such as a promotion or gift card offer), constitute the entire agreement between you and Dasta regarding the Dasta Services and supersede any prior agreements on the same subject.","heading":"25. Entire Agreement"},{"body":"If you downloaded the Dasta mobile application from Apple's App Store, the following additional terms apply. These Terms are between you and Dasta, not Apple, and Dasta, not Apple, is solely responsible for the Dasta mobile application and its content.\n\nLicense Scope. Subject to these Terms, Dasta grants you a personal, limited, non-exclusive, non-transferable license to use the Dasta mobile application on Apple-branded products that you own or control and as permitted by the usage rules in the Apple Media Services Terms and Conditions, including use through permitted Family Sharing or volume-purchase arrangements where applicable.\n\nMaintenance and Support. Dasta, not Apple, is responsible for providing any maintenance and support services for the Dasta mobile application as required by applicable law or these Terms. Apple has no obligation to furnish maintenance or support services.\n\nWarranty. To the extent any warranty applies to the Dasta mobile application and the application fails to conform to that warranty, you may notify Apple, and Apple may refund the purchase price, if any, paid to Apple for the application. To the maximum extent permitted by applicable law, Apple has no other warranty obligation with respect to the Dasta mobile application. Dasta is responsible for any other claims, losses, liabilities, damages, costs, or expenses attributable to a failure to conform to an applicable warranty, subject to these Terms and applicable law.\n\nProduct Claims. Dasta, not Apple, is responsible for addressing claims by you or any third party relating to the Dasta mobile application or your possession or use of it, including product-liability claims, claims that the application fails to conform to applicable legal or regulatory requirements, and claims arising under consumer-protection, privacy, or similar law.\n\nIntellectual Property Claims. If a third party claims that the Dasta mobile application or your possession and use of it infringes that party's intellectual-property rights, Dasta, not Apple, is responsible for the investigation, defense, settlement, and discharge of that claim.\n\nLegal Compliance. You represent and warrant that you are not located in a country or region subject to a U.S. Government embargo or designated by the U.S. Government as a \"terrorist supporting\" country or region, and that you are not listed on any U.S. Government list of prohibited or restricted parties.\n\nThird-Party Terms. You must comply with applicable third-party terms when using the Dasta mobile application, including terms applicable to your wireless-data service, device platform, authentication provider, and payment provider.\n\nThird-Party Beneficiary. Apple and Apple's subsidiaries are third-party beneficiaries of these Terms as they relate to the Dasta mobile application. Upon your acceptance of these Terms, Apple will have the right (and will be deemed to have accepted the right) to enforce these Terms against you as a third-party beneficiary.\n\nDeveloper Contact. Questions, complaints, or claims relating to the Dasta mobile application should be directed to Dasta using the contact information in Section 27.","heading":"26. Apple End User License Agreement Terms"},{"body":"Dasta LLC\n151 West Gorham Street, Madison, WI 53703\nEmail: support@dastacafe.com\n\nQuestions, complaints, or claims regarding the Dasta Services may be directed to the contact information above. Privacy-related requests may also be submitted using the methods described in the Dasta Privacy Policy.","heading":"27. Contact"}]} },
+  "discover-dasta-rewards": { title: "Discover Dasta Rewards", data: {"tiers":[{"name":"Fresh Leaf","intro":"Founder Journey Starts here:","perks":["Birthday Drink","Early access to seasonal drinks","Priority invitations to special events"],"highlight":"You're helping Dasta take root"},{"name":"Silver Leaf","intro":"Everything in Fresh Leaf plus:","perks":["Vote on future drinks","Founder Polls","Double-Leaf Days"],"highlight":"You're helping Dasta grow"},{"name":"Golden Leaf","intro":"Everything in Silver Leaf plus:","perks":["Secret Menu Access","Seasonal drink previews","Tasting event Invitations"],"highlight":"Helping shape the future of Dasta"},{"name":"Evergreen Leaf","intro":"Everything in Gold Leaf plus:","perks":["Status for Life","Wall Recognition","First access to major launches"],"highlight":"A permanent place in Dasta's story"}],"heading":"Dasta Rewards & Founders Circle","impactRows":[{"field":"leaves_collected","label":"Lifetime Leaves Earned:"},{"field":"free_drinks_redeemed","label":"Free Drinks Claimed"},{"field":"trees_to_be_planted","label":"Saplings to be Planted"},{"field":"founder_members","label":"Founder Members"}],"subheading":"Your Dasta Plant grows leaves for rewards, and\nYour grove with Dasta grows saplings !!","trustIntro":"Your payment information deserves the highest level of protection. That's why Dasta Account card payments are processed by Clover, a trusted payments platform.","trustTitle":"Your Trust Matters","circleIntro":"Collect Leaves. Earn free drinks. Grow your grove.","circleTitle":"Dasta Rewards","closingBody":"Because loyalty should never expire.","footerBanner":"Dasta Account : Protected by Clover. Built for Dasta.","trustBullets":["Bank-level encryption","Secure payment processing","Dasta never stores your banking credentials","Trusted by millions of customers worldwide"],"circleBullets":["Earn leaves with eligible purchases","Redeam leaves for free drinks","Grow lifetime saplings with Dasta Rewards","Your leaves never expire","Payments protected by Clover"],"closingItalic":"Leaves always stay green at Dasta.","impactApiPath":"/sip/community-impact","tiersImageAlt":"Four leaves in green, silver, gold, and dark green with labels showing leaves and saplings count.","tiersImageUrl":"https://cdn.prod.website-files.com/69dece9688dac5181962f293/6a374cf6235f0819a1b201c3_0ede7f2c0fd38d43bf612746399d804b_Fouders%20Tier.png","dastaCardIntro":"Load funds once and pay seamlessly in-store or online while earning Leaves with every purchase.","dastaCardTitle":"Dasta Card","memberBenefits":[{"body":"Earn rewards automatically as your plant grows.","title":"Free Drinks"},{"body":"Pay quickly using your Dasta Account.","title":"Faster Checkout"},{"body":"Connect with SipSense to create personalized drink recommendations and member experiences.","title":"Personalized Experiences"},{"body":"Members will receive access to special offers, bonus Leaf events, and seasonal rewards.","title":"Exclusive Promotions"}],"dastaCardFooter":"Every purchase made through Dasta Rewards helps your plant grow.","howItWorksSteps":[{"body":"Create your free account in minutes.","title":"Join Dasta Rewards"},{"body":"Every eligible Dasta purchase adds Leaves to your account.","title":"Earn Leaves"},{"body":"Use your leaves for free drinks.","title":"Enjoy Rewards"},{"body":"Your lifetime leaves help Dasta plant saplings every spring season. (50 leaves per sapling)","title":"Grow your grove"}],"howItWorksTitle":"How It Works :","impactCardTitle":"🌍 Dasta Community Impact","whyFounderIntro":"Most rewards programs recognize purchases. Founders Circle recognizes people.","whyFounderTitle":"Why Become a Founder?","cardPaymentsBody":"Dasta Account has an option to save their preferred payment method (up to 3 cards) and enjoy the same rewards and benefits. One of your saved cards could be set as the default card for payment and auto-reload Dasta Card.\n\nBank level security with card details stored at Clover.","dastaCardBullets":["Pay using a secure QR code","Track spending history","Access member rewards automatically"],"cardPaymentsTitle":"Credit or Debit Card payments","foundersCircleIntro":"Some leaves become free drinks. Every ten leaves become a real sapling. Together, we're growing something much bigger.\n\nFounders Circle recognizes the guests who help Dasta grow through every visit, every recommendation, and every shared experience.","foundersCircleTitle":"Founders Circle","growingTogetherBody":"At Dasta, leaves mean more than rewards. While 10 leaves unlock a free drink, they also contribute to something bigger. Every 50 leaves earned by our community, Dasta commits to planting one sapling each year. As our community grows, so does our impact.\n\nTogether, we're transforming everyday ritual into a greener future.","memberBenefitsTitle":"Member Benefits","growingTogetherTitle":"Growing Together","leavesNeverExpireNote":"Leaves never expire."} },
+  "privacy-policy": { title: "Dasta Privacy Policy", data: {"sections":[{"body":"Last Updated: September 21, 2026","heading":"Effective Date: November 20, 2026"},{"body":"This Privacy Policy explains how Dasta LLC (\"Dasta,\" \"we,\" \"us,\" or \"our\") collects, uses, discloses, stores, and protects information when you use the Dasta mobile application, DastaCafe.com, SipSense, Dasta Rewards, Dasta Card, mobile ordering, gifting, gift cards, and other Dasta products, features, and services (collectively, the \"Dasta Services\"). It also explains the choices and rights available to you regarding your information.\n\nThis Privacy Policy is intended to describe Dasta's current privacy practices for the Dasta Services. Some features are optional, and the information Dasta processes depends on the features you choose to use, the permissions you grant, and the services available at a particular time or location.","heading":""},{"body":"Depending on how you use the Dasta Services, we may collect or process the following categories of information.","heading":"1. Information We Collect"},{"body":"We may collect your name, email address, telephone number, Dasta customer or account identifier, birthday month and day when you choose to provide it, and other contact or profile information you provide. Certain profile fields are optional and are used only for the purposes described when collected.","heading":"Account and Contact Information"},{"body":"We process information needed to create, authenticate, secure, and manage your account. This may include email or SMS verification information, authentication and session identifiers, trusted-device information, and information associated with Sign in with Apple or Google Sign-In when you choose those methods. Apple and Google determine what account information they provide to Dasta based on their services and your choices.","heading":"Authentication and Account Security Information"},{"body":"We may collect information about orders, purchased items, drink or food customizations, pickup details, transaction status, purchase history, refunds, rewards earned or redeemed, gifts, gift cards, Dasta Card transactions, and related activity necessary to provide the Dasta Services.","heading":"Order, Purchase, and Transaction Information"},{"body":"Eligible card payments are processed by Clover or another payment processor identified at the time of payment. Card credentials may be entered directly into interfaces provided by the payment processor. Dasta may receive limited payment-related information such as payment status, transaction identifiers, payment method type, and limited card descriptors made available by the processor. Dasta does not receive or store complete payment-card numbers or card security codes when those credentials are processed directly by the payment processor.","heading":"Payment Information"},{"body":"If you participate in Dasta Rewards, we process information such as leaves earned and redeemed, rewards, program status, and related activity. If you use Dasta Card, we process Dasta Card identifiers, balances, reload activity, transaction history, Auto Reload settings, and information needed to operate and secure the service. If you purchase or send a gift, we may process purchaser information, recipient information you provide, gift details, delivery information, redemption status, and associated transaction information.","heading":"Dasta Rewards, Dasta Card, and Gift Information"},{"body":"When you use SipSense, we may process information you provide about beverage preferences, cravings, mood, desired flavors, dietary preferences, customizations, previous selections, text prompts, voice input or transcriptions, and other information you choose to provide. We use this information to provide and improve personalized beverage or food recommendations and related Dasta experiences.\n\nSipSense recommendations are intended for discovery and convenience and should not be relied upon as a substitute for verifying ingredients, allergens, dietary restrictions, or other individual requirements directly with Dasta.","heading":"SipSense and Personalization Information"},{"body":"When you choose to use voice-enabled features, the Dasta mobile application or your browser on DastaCafe.com may access your device or browser microphone with your permission to recognize spoken navigation shortcuts, receive SipSense input, or perform another voice-enabled action you request. Depending on the feature, device, browser, operating system, language, and availability, speech may be processed through operating-system or browser speech-recognition services or transmitted securely to Dasta systems for transcription and processing. Dasta does not retain raw voice recordings on Dasta-controlled infrastructure after the applicable voice request has been processed. Where speech recognition is performed by an operating-system, browser, or platform service, that provider may process voice or speech data in accordance with its own privacy terms and device or browser settings. Dasta may process the resulting transcription as described in this Privacy Policy.","heading":"Voice and Speech Information"},{"body":"When you choose a location-based feature and grant permission, the Dasta mobile application or your browser on DastaCafe.com may access your device's or browser's foreground location to identify a nearby Dasta café, provide directions, or support another location-related feature you request. Dasta does not request background location for the current mobile-app or website functionality. You may decline or revoke location permission through your device or browser settings.","heading":"Location Information"},{"body":"We may process device type, operating system, app version, device or session identifiers, authentication/session information, IP address, diagnostic information, error information, and other technical information reasonably necessary to operate, secure, troubleshoot, and improve the Dasta Services. Information processed solely on your device or ephemerally may be treated differently under applicable platform disclosure rules.","heading":"Device, Session, and Technical Information"},{"body":"We may collect communications you send to Dasta, including customer-support requests, feedback, survey responses, email or SMS interactions, notification preferences, and other information you choose to submit.","heading":"Communications, Feedback, and Support"},{"body":"DastaCafe.com uses cookies and similar technologies that are necessary for the website to function, such as maintaining your session, remembering preferences, and protecting the security of the site. Consistent with Section 3, Dasta does not use cookies or similar technologies to sell personal information or to engage in cross-context behavioral advertising.","heading":"Cookies and Similar Technologies (DastaCafe.com)"},{"body":"We may use information described in this Privacy Policy to:\n• provide, operate, maintain, and improve the Dasta Services;\n• create, authenticate, secure, and manage Dasta accounts and trusted sessions;\n• process orders, payments, refunds, Dasta Card activity, gift cards, gifts, and related transactions;\n• operate Dasta Rewards, calculate and redeem leaves and rewards, and provide eligible program benefits;\n• generate and personalize SipSense recommendations and saved preferences;\n• process voice commands and transcriptions when you choose to use voice-enabled features;\n• identify nearby Dasta cafés and provide location-related functionality when you request it;\n• send transactional, account-security, order, reward, gift, and service communications;\n• send marketing communications where permitted and consistent with your choices;\n• provide customer support and respond to feedback or requests;\n• detect, investigate, and prevent fraud, abuse, unauthorized access, security incidents, and technical problems;\n• analyze and improve the performance, reliability, usability, and security of the Dasta Services, to the extent applicable; and\n• comply with legal, tax, accounting, regulatory, dispute-resolution, and enforcement obligations.","heading":"2. How We Use Information"},{"body":"We do not disclose personal information except as described in this Privacy Policy, as directed by you, or as otherwise permitted or required by law.","heading":"3. How We Disclose Information"},{"body":"We may disclose information to service providers that process information on our behalf or provide infrastructure and functionality needed to operate the Dasta Services. Depending on the feature used, these providers may include payment processors such as Clover; cloud, hosting, authentication, communications, and security providers; Apple and Google platform or identity services; Expo-related application infrastructure where used; mapping or location services; and other vendors that support Dasta operations.\n\nDasta requires service providers that receive personal information from Dasta to protect that information consistent with their contractual obligations, applicable law, and the protections described in this Privacy Policy, as appropriate to the services they provide.","heading":"Service Providers"},{"body":"Certain SipSense and voice features use automated processing, speech recognition, transcription, or artificial-intelligence technologies to respond to customer requests and generate personalized recommendations. SipSense may consider information voluntarily provided by the customer, such as preferences, cravings, mood, desired flavors, dietary preferences, customizations, and the context of a particular request.\n\nDasta does not sell or disclose customer personal information to third-party artificial-intelligence providers for their independent use, advertising, or model training. Where Dasta uses third-party technology providers to process information on Dasta's behalf, those providers may process only the information necessary to provide the applicable service, subject to applicable contractual, legal, and platform requirements.","heading":"Artificial Intelligence and Speech Processing"},{"body":"We may disclose information when we reasonably believe disclosure is necessary to comply with law or legal process, enforce our agreements, investigate fraud or security incidents, protect the rights, property, or safety of Dasta, our customers, or others, or in connection with a merger, financing, acquisition, reorganization, sale of assets, or similar corporate transaction, subject to applicable law.","heading":"Legal, Safety, and Corporate Purposes"},{"body":"Dasta does not sell personal information and does not share personal information for cross-context behavioral advertising or use customer personal information for third-party targeted advertising.","heading":"Sale and Targeted Advertising"},{"body":"The Dasta mobile application and DastaCafe.com request device or browser permissions only when they are relevant to an available feature. You may decline optional permissions, although the related feature may then be unavailable.\n• Location: manage foreground location permission in your iOS or Android device settings, or through your browser settings when using DastaCafe.com.\n• Microphone and Speech Recognition: manage microphone and speech-recognition permissions in your device or browser settings. Voice features are optional.\n• Notifications and Communications: manage eligible communication preferences within Dasta and through your device, browser, email, or SMS settings, as applicable. If push notifications are enabled in the version of the Dasta app you use, you may manage push-notification permission through your device settings. Certain transactional or security communications may still be sent through available channels when necessary to provide the service.\n• Marketing Email and SMS: use the applicable unsubscribe or opt-out mechanism and account preferences. Transactional or security communications may not be subject to marketing opt-out choices.\n• Profile Information: update eligible account information through the Dasta Services or contact Dasta.\n• Auto Reload: change or disable Auto Reload through Dasta Card settings; changes apply to future reloads.\n• Cookies: manage cookies and similar technologies through your browser settings. Dasta does not currently sell personal information or share it for cross-context behavioral advertising, so opt-out mechanisms for those practices, including recognition of Global Privacy Control signals, are not applicable at this time; if that changes, Dasta will provide an appropriate mechanism as required by law.\n\nWhere Dasta relies on consent to process information, you may withdraw that consent through the applicable settings or contact method. Withdrawal does not affect processing that was lawful before withdrawal.","heading":"4. Permissions and Your Choices"},{"body":"Dasta retains personal information only for as long as reasonably necessary for the purposes described in this Privacy Policy, including to provide the Dasta Services, maintain accounts and transaction records, meet legal, tax, accounting, and regulatory requirements, prevent fraud, resolve disputes, and enforce agreements. Retention periods vary based on the type of information, the feature involved, and applicable obligations.\n\nWhen information is no longer reasonably required, Dasta will delete, de-identify, aggregate, or otherwise dispose of it as appropriate. Some transaction, accounting, security, fraud-prevention, or legal records may be retained after account deletion when retention is required or permitted by law.\n\nRaw voice recordings processed by Dasta are not retained by Dasta after the applicable voice request has been processed. SipSense inputs, transcriptions, preferences, and recommendation history may be retained when necessary to provide saved preferences, personalization, account functionality, security, or service improvement, subject to the retention principles described above.","heading":"5. Data Retention"},{"body":"You may initiate deletion of your Dasta account through the account settings available on DastaCafe.com or from within the Dasta mobile application by opening your account menu and selecting Delete My Account.\n\nIf you no longer have access to your Dasta account or the Dasta mobile application, you may request deletion of your Dasta account and associated personal information by emailing privacy@dastacafe.com. Please submit the request using the email address associated with your Dasta account when possible. Dasta may take reasonable steps to verify your identity before completing the request.\n\nWhen an account-deletion request is completed, Dasta deletes or de-identifies personal information associated with the account except information that Dasta must or is permitted to retain for legitimate purposes such as legal, tax, accounting, security, fraud-prevention, regulatory, or dispute-resolution obligations.\n\nAccount deletion may affect unused rewards, saved preferences, gifts, and other account-linked benefits. Paid stored value, gift cards, and transaction records will be handled in accordance with applicable law and the Dasta Terms of Use.","heading":"6. Account and Data Deletion"},{"body":"Dasta uses administrative, technical, and organizational safeguards designed to protect personal information against unauthorized access, loss, misuse, alteration, or disclosure. Dasta uses secure network communications for its production services and relies on specialized service providers for certain functions such as payment processing. However, no method of electronic transmission or storage can guarantee absolute security.","heading":"7. Security"},{"body":"The Dasta Services are not directed to children under 13, and Dasta does not knowingly collect personal information from children under 13 without appropriate authorization. If Dasta learns that personal information from a child has been collected in violation of applicable law, Dasta will take appropriate steps to delete it.\n\nUsers who are minors in their jurisdiction should use the Dasta Services only with the involvement and consent required by applicable law and the Dasta Terms of Use. Dasta does not intend to use children's personal information for targeted advertising or profiling.","heading":"8. Children's Privacy"},{"body":"Depending on where you live and subject to applicable law and exemptions, you may have rights regarding personal information, which may include rights to request access, correction, deletion, or a copy of certain information, and rights relating to certain sales, sharing, or targeted advertising practices. Dasta will not discriminate against you for exercising rights provided by applicable law.\n\nTo submit a privacy request, contact Dasta using the information in Section 14. Dasta may need to verify your identity and may request information reasonably necessary to process the request. Authorized agents may submit requests where permitted by law and subject to appropriate verification.\n\nDepending on your state of residence, these rights may include the right to:\n• know or access the personal information Dasta has collected about you;\n• correct inaccurate personal information;\n• delete personal information, subject to certain exceptions;\n• obtain a copy of your personal information in a portable format; and\n• opt out of the sale or sharing of personal information, targeted advertising, and, where applicable, certain uses of sensitive personal information.\n\nAs described in Section 3, Dasta does not sell personal information and does not share personal information for cross-context behavioral advertising. Where Dasta processes any sensitive personal information, such as precise location or voice input, Dasta limits that processing to the purposes described in this Privacy Policy and does not use it to infer characteristics about you.\n\nIf Dasta declines to act on a privacy request, you may have the right to appeal that decision under applicable state law. To appeal, contact Dasta using the information in Section 14 and reference your original request; Dasta will respond to the appeal within the time required by applicable law.","heading":"9. U.S. State Privacy Rights"},{"body":"Dasta is based in the United States, and the Dasta Services are primarily intended for customers in the United States. If you access the Dasta Services from outside the United States, information may be processed in the United States and other locations where Dasta or its service providers operate, subject to applicable law. Availability of the Dasta mobile application through an app store in a particular jurisdiction does not necessarily mean that all Dasta Services are offered or available in that jurisdiction.","heading":"10. International Use"},{"body":"The Dasta Services may interact with third-party services, including Clover, Apple, Google, mapping services, authentication services, and other providers. Those providers may process information under their own privacy policies when you interact directly with their services. Dasta is not responsible for the privacy practices of independent third-party websites or services that are not acting as Dasta's service providers.\n\nDasta's use of a service provider does not authorize that provider to use Dasta customer information for unrelated purposes beyond what is permitted by applicable contracts, law, and platform requirements.","heading":"11. Third-Party Services and Links"},{"body":"Dasta distributes its mobile application through platforms that require separate privacy disclosures. Dasta maintains App Store privacy information for Apple and a Data Safety section for Google Play. Those disclosures are intended to reflect the data practices of the production version of the Dasta mobile application and should be read together with this Privacy Policy.\n\nDasta is responsible for keeping those platform disclosures accurate as the app changes, including disclosures relating to account/contact information, identifiers, purchase history, user content, location, voice or audio information where applicable, and data processed by third-party SDKs or service providers.\n\nApple and Google may independently collect information when you use their devices, app stores, operating systems, authentication services, speech-recognition services, or other platform features. Their processing is governed by their own privacy policies and terms.","heading":"12. Apple App Store and Google Play Privacy Disclosures"},{"body":"Dasta may update this Privacy Policy to reflect changes to the Dasta Services, data practices, technology, legal requirements, or platform requirements. Dasta will update the \"Last Updated\" date above and will provide additional notice when required by applicable law. Material changes will apply prospectively as required by law.","heading":"13. Changes to This Privacy Policy"},{"body":"Dasta LLC\n151 West Gorham Street\nMadison, WI 53703\nPrivacy inquiries: privacy@dastacafe.com\nCustomer support: support@dastacafe.com\n\nQuestions, complaints, requests to exercise privacy rights, or concerns about this Privacy Policy may be submitted using the contact information above.","heading":"14. Contact Us"}]} },
+  "terms-of-use": { title: "Dasta Terms of Use", data: {"sections":[{"body":"Last Updated: September 21, 2026","heading":"Effective Date: November 20, 2026"},{"body":"These Terms of Use (\"Terms\") govern your access to and use of the Dasta mobile application, DastaCafe.com, SipSense, Dasta Account, Dasta Card, mobile ordering, gifting, gift cards, and other products, features, and services provided by Dasta (collectively, the \"Dasta Services\").\n\nBy accessing or using the Dasta Services, creating an account, placing an order, or participating in Dasta programs, you agree to these Terms and our Privacy Policy. If you do not agree to these Terms, you should not use the Dasta Services.","heading":"1. Acceptance of Terms"},{"body":"Certain Dasta Services may be used without creating an account. Other features, including My Circles, Dasta Card, saved preferences, gifting, and certain personalized services, may require a Dasta account.\n\nYou must be at least 13 years old to create a Dasta account. If you are a minor in your jurisdiction, you may use the Dasta Services, including Dasta Card and gift cards, only with the involvement and consent of a parent or legal guardian who holds the account and payment method. By creating an account, you represent that you meet these requirements.\n\nYou agree to provide accurate information and to keep your account information current. You are responsible for maintaining the security of your account and for activity occurring through your account.\n\nDasta may support authentication through email, phone number, Sign in with Apple, Google Sign-In, or other authentication methods made available from time to time.\n\nIf you believe your account has been accessed without authorization, contact Dasta promptly at support@dastacafe.com.","heading":"2. Eligibility and Accounts"},{"body":"Dasta allows customers to order beverages, food, and other eligible products for pickup or other available fulfillment methods.\n\nPrices, product availability, ingredients, customization options, taxes, fees, and promotions may vary by location and may change without notice. An order is not final until it has been accepted by Dasta.\n\nDasta may cancel or modify an order when an item is unavailable, an order cannot reasonably be fulfilled, a pricing or technical error occurs, or other circumstances prevent fulfillment. If Dasta cancels an order after payment has been captured, Dasta will provide an appropriate refund or other remedy consistent with Section 17 (Refunds and Cancellations) and applicable law.","heading":"3. Mobile Ordering and Purchases"},{"body":"Payments made through the Dasta mobile application may be processed by Clover or another payment processor identified at the time of purchase. Payment information provided for card transactions is processed by the applicable payment processor in accordance with its terms and privacy practices.\n\nDasta does not store complete payment-card numbers or card security codes on its own systems when those credentials are processed directly by our payment processor.\n\nBy submitting a payment method, you represent that you are authorized to use that payment method and authorize the applicable charges associated with your transaction.","heading":"4. Payments"},{"body":"Dasta Card is a stored-value feature that allows eligible customers to load funds and use the available balance for qualifying purchases from Dasta.\n\nFunds loaded to a Dasta Card are not a bank deposit, checking account, savings account, credit card, or general-purpose payment account and may be used only as permitted by Dasta.\n\nDasta Card balances are subject to applicable law and any additional terms presented when funds are loaded or used. Except where required by law, Dasta Card value is intended for purchases from Dasta and is not redeemable for cash. Nothing in these Terms limits rights that cannot lawfully be waived, including rights that may apply to stored value, unclaimed property, or refunds in a particular jurisdiction.\n\nAuto Reload. If you enable Auto Reload, you authorize Dasta and its payment processor to automatically charge your selected payment method according to the reload threshold and reload amount you select.\n\nYou may change or disable Auto Reload through your Dasta account settings. Disabling Auto Reload will apply to future automatic reloads and will not reverse transactions that have already been processed.\n\nAuto reload will be paused for 24h if there are two consecutive reloads within a span of 10 minutes. This specific feature is added to protect any fraud activity. During reload pause, the customer could use other option \"add money\" feature to load the card.","heading":"5. Dasta Card"},{"body":"Dasta may allow customers to purchase gift cards or send eligible beverages, food, rewards, or other gifts to another person.\n\nGift cards and gifts may be subject to redemption requirements, expiration restrictions where permitted by law, location restrictions, promotional conditions, and other terms displayed at the time of purchase.\n\nThe purchaser is responsible for providing accurate recipient information. Dasta is not responsible for delivery failures resulting from inaccurate recipient information supplied by the purchaser, except as required by applicable law.\n\nGift card purchases are non-refundable except as required by applicable law or as described in Section 17 (Refunds and Cancellations). Any expiration, inactivity, redemption, or cash-redemption terms applicable to a Dasta gift card will be administered in accordance with applicable law and any terms disclosed at purchase.","heading":"6. Gift Cards and Gifting"},{"body":"Dasta Rewards is Dasta's customer loyalty and rewards program. Eligible customers may earn leaves, rewards, benefits, promotional offers, status, or other program benefits through qualifying activity.\n\nLeaves and other Dasta Rewards benefits have no cash value unless expressly stated otherwise and may not be transferred, sold, or exchanged for cash except where required by law.\n\nDasta may establish or modify earning rules, redemption requirements, reward availability, promotional offers, program tiers, and other program terms. Material changes will be communicated as required by applicable law.","heading":"7. Dasta Rewards"},{"body":"SipSense is Dasta's personalized beverage discovery and recommendation experience. SipSense may use information you provide, including preferences, cravings, mood, customizations, text or voice input, prior selections, and other relevant information, to generate beverage and food recommendations.\n\nSipSense recommendations are generated for convenience and discovery. Recommendations may not always reflect every ingredient, dietary preference, allergy, nutritional requirement, or other individual consideration.\n\nCustomers with food allergies, intolerances, medical dietary restrictions, or other ingredient concerns should verify ingredients directly with Dasta before ordering and should not rely solely on a SipSense recommendation. See Section 19 (Disclaimer of Warranties) for additional information.","heading":"8. SipSense"},{"body":"Dasta may provide optional voice-enabled features that allow you to navigate the app, enter SipSense requests, use voice-activated shortcuts, or interact with certain Dasta Services using speech.\n\nVoice recognition may occasionally misunderstand or incorrectly transcribe spoken input. You are responsible for reviewing order details, selections, and other important information -- including anything added to your cart or submitted for purchase through a voice command -- before confirming a transaction.\n\nUse of voice features may involve microphone access and speech processing as described in the Dasta Privacy Policy. You can manage microphone and speech-recognition permissions through your device settings.","heading":"9. Voice Features"},{"body":"With your permission, the Dasta mobile application may use your device's location to identify nearby Dasta cafés, provide directions, or enable other location-related features.\n\nLocation access is optional. You may decline or disable location access through your device settings, although certain location-based features may then be unavailable.\n\nDasta's collection and use of location information is described in the Dasta Privacy Policy. The mobile application is designed to request location access only for location-related features made available to you.","heading":"10. Location Services"},{"body":"Depending on your settings and permissions, Dasta may communicate with you through email, SMS/text messages, in-app messages, or push notifications regarding orders, account activity, rewards, gifts, promotions, and other Dasta Services.\n\nYou may manage eligible communication preferences through your account, device settings, or applicable unsubscribe mechanisms. Certain transactional or account-security communications may still be sent when necessary to provide the Dasta Services.","heading":"11. Notifications and Communications"},{"body":"If you provide suggestions, comments, feedback, reviews, ideas, or other submissions regarding Dasta or the Dasta Services, you grant Dasta permission to use that feedback to operate, improve, and develop its products and services, subject to applicable law and our Privacy Policy.","heading":"12. Feedback and User Submissions"},{"body":"The Dasta Services and their associated software, designs, interfaces, branding, text, graphics, functionality, recommendations, and other content are owned by or licensed to Dasta and are protected by applicable intellectual-property laws.\n\nDasta, SipSense, Dasta Rewards, Dasta Card, associated logos, and other Dasta marks may be trademarks or service marks of Dasta.\n\nCertain SipSense technology and functionality are the subject of a pending U.S. patent application. \"Patent pending\" status does not imply that a patent has been granted but the application is under review by USPTO.","heading":"13. Intellectual Property"},{"body":"If you engage in any of the following actions, Dasta may suspend or terminate your access to the Dasta Services, pursue all available civil remedies, and refer the matter to law enforcement or other appropriate authorities where warranted:\n• fraud;\n• unauthorized account access;\n• abuse of promotions/rewards;\n• manipulating Dasta Account balances;\n• reverse engineering where legally permissible;\n• automated scraping;\n• interfering with the app/API;\n• attempting to access another customer's data;\n• fraudulent payments, gift cards, or Dasta Card activity.","heading":"14. Prohibited Uses"},{"body":"Dasta may restrict or suspend access when reasonably necessary to protect customers, investigate suspected fraud or misuse, comply with law, protect Dasta systems, or enforce these Terms.\n\nCustomers may stop using the Dasta Services at any time and may request deletion of their Dasta account through the account settings available in the mobile application. Dasta may also provide an external account-deletion request method for users who no longer have access to the application.","heading":"15. Account Suspension and Termination"},{"body":"You may initiate deletion of your Dasta account from within the Dasta mobile application. Account deletion permanently deletes or de-identifies associated personal information except information Dasta must retain for legitimate purposes such as legal, tax, accounting, fraud-prevention, dispute-resolution, or regulatory obligations.\n\nBefore deletion, Dasta may inform you of outstanding balances, unredeemed gifts, rewards, transactions, or other account items that may be affected by deletion. Deleting an account may result in the loss of unused rewards, saved preferences, and other account-linked benefits, subject to applicable law and any separate rights associated with paid stored value or gift cards. Dasta may require reasonable steps to verify your identity before completing a deletion request. Additional information about deletion, retention, and your privacy rights is provided in the Dasta Privacy Policy.","heading":"16. Account Deletion"},{"body":"Because Dasta prepares food and beverages, including custom SipSense creations, to order, all sales are generally final once an order has been accepted and preparation has begun. The following exceptions apply:\n• Dasta Error. If Dasta is unable to fulfill an order, made an error in preparing it, or a pricing or technical error occurred, Dasta will issue a refund to the Dasta card found on customer's Dasta Account.\n• Customer-Initiated Cancellation. You may cancel an order before Dasta has begun preparing it or in case of My Circles group order, you may cancel the order until cutoff time listed on the group order. Once preparation has begun -- including once a custom SipSense drink has been crafted into a build ticket -- the order can no longer be canceled for a refund except as described above.\n• Gift Cards. Gift card purchases are non-refundable except as required by applicable law.\n• Dasta Card. Funds loaded to a Dasta Card are non-refundable except as required by applicable law or as described in Section 5 (Dasta Card).\n• Rewards and Redemptions. If an order that would have earned leaves, rewards, or a free-drink redemption is canceled or refunded, any leaves, rewards, or redemption associated with that order may be reversed or forfeited.\n\nIn store refunds are typically issued to the original payment method as long as the original receipt is presented during the return. Anywhere permitted by law and agreed to by the customer, Dasta may offer another form of credit or remedy. Processing times vary by payment provider and financial institution.","heading":"17. Refunds and Cancellations"},{"body":"The Dasta Services may interoperate with or rely on third-party services, including payment processors, identity providers, device-platform services, mapping or location services, communications providers, and other technology providers. Your use of a third-party service may also be governed by that provider's terms and privacy practices. Dasta is not responsible for third-party services except to the extent required by applicable law or expressly stated in these Terms.","heading":"18. Third-Party Services"},{"body":"TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE DASTA SERVICES -- INCLUDING THE DASTA MOBILE APPLICATION, DASTACAFE.COM, SIPSENSE, DASTA REWARDS, DASTA CARD, AND ALL RELATED FEATURES AND CONTENT -- ARE PROVIDED \"AS IS\" AND \"AS AVAILABLE,\" WITHOUT WARRANTIES OF ANY KIND, WHETHER EXPRESS, IMPLIED, OR STATUTORY, INCLUDING BUT NOT LIMITED TO THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT.\n\nDasta does not warrant that the Dasta Services will be uninterrupted, secure, or error-free, that defects will be corrected, or that SipSense recommendations, voice-recognition results, or any other automatically generated content will be accurate, complete, or suitable for your individual dietary, allergy, or health needs. As described in Section 8 (SipSense), you should verify ingredients directly with Dasta rather than relying solely on a SipSense recommendation.\n\nNothing in this section is intended to limit any warranty that cannot be excluded under applicable law, including any statutory rights you may have as a consumer, or any warranty Dasta separately provides regarding the food and beverage products themselves under applicable food-safety law.","heading":"19. Disclaimer of Warranties"},{"body":"TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, DASTA AND ITS OFFICERS, EMPLOYEES, AND AGENTS WILL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES, OR ANY LOSS OF PROFITS, REVENUE, DATA, OR GOODWILL, ARISING FROM OR RELATED TO YOUR USE OF THE DASTA SERVICES, EVEN IF DASTA HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.\n\nTO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, DASTA'S TOTAL LIABILITY TO YOU FOR ANY CLAIM ARISING FROM OR RELATED TO THE DASTA SERVICES WILL NOT EXCEED THE GREATER OF (A) THE AMOUNT YOU PAID TO DASTA THROUGH THE DASTA SERVICES IN THE ONE HUNDRED EIGHTY (180) DAYS BEFORE THE EVENT GIVING RISE TO THE CLAIM, OR (B) FIFTY DOLLARS ($50).\n\nSome jurisdictions do not allow the exclusion or limitation of certain damages, so some or all of the exclusions and limitations in this section may not apply to you.","heading":"20. Limitation of Liability"},{"body":"To the maximum extent permitted by applicable law, you agree to indemnify, defend, and hold harmless Dasta, its officers, employees, and agents from and against any claims, damages, losses, liabilities, costs, and expenses (including reasonable attorneys' fees) arising from or related to: (a) your use or misuse of the Dasta Services; (b) your violation of these Terms; (c) your violation of any applicable law or the rights of a third party; or (d) any content, information, or payment method you submit through the Dasta Services.\n\nDasta reserves the right, at its own expense, to assume the exclusive defense and control of any matter otherwise subject to indemnification by you, in which case you agree to cooperate with Dasta's defense of that claim.","heading":"21. Indemnification"},{"body":"These Terms and any dispute arising from or related to the Dasta Services are governed by the laws of the State of Wisconsin, without regard to its conflict-of-laws principles, except to the extent superseded by applicable federal law.\n\nBefore initiating arbitration, the party asserting a dispute will first provide the other party with written notice describing the dispute and requested relief and allow a reasonable opportunity to resolve the matter informally. If the dispute is not resolved informally, any dispute, claim, or controversy arising from or relating to these Terms or the Dasta Services will be resolved by binding arbitration on an individual basis, rather than in court, except that either party may bring an individual action in small claims court where eligible. YOU AND DASTA EACH WAIVE THE RIGHT TO A JURY TRIAL AND TO PARTICIPATE IN A CLASS ACTION, CLASS ARBITRATION, OR REPRESENTATIVE ACTION, TO THE EXTENT PERMITTED BY APPLICABLE LAW.\n\nIf any part of this arbitration agreement is found unenforceable, that part will be severed and the remainder will remain in effect, except that if the class-action waiver is found unenforceable, the entire arbitration agreement will be unenforceable.","heading":"22. Governing Law and Dispute Resolution"},{"body":"Dasta may update these Terms from time to time. If Dasta makes a material change, Dasta will provide notice through the Dasta mobile application, by email, or by another reasonable method before the change takes effect. Your continued use of the Dasta Services after a change becomes effective constitutes acceptance of the updated Terms.","heading":"23. Changes to These Terms"},{"body":"If any provision of these Terms is found to be unenforceable or invalid, that provision will be limited or eliminated to the minimum extent necessary, and the remaining provisions will remain in full force and effect.","heading":"24. Severability"},{"body":"These Terms, together with the Privacy Policy and any additional terms presented for a specific Dasta Service (such as a promotion or gift card offer), constitute the entire agreement between you and Dasta regarding the Dasta Services and supersede any prior agreements on the same subject.","heading":"25. Entire Agreement"},{"body":"If you downloaded the Dasta mobile application from Apple's App Store, the following additional terms apply. These Terms are between you and Dasta, not Apple, and Dasta, not Apple, is solely responsible for the Dasta mobile application and its content.\n\nLicense Scope. Subject to these Terms, Dasta grants you a personal, limited, non-exclusive, non-transferable license to use the Dasta mobile application on Apple-branded products that you own or control and as permitted by the usage rules in the Apple Media Services Terms and Conditions, including use through permitted Family Sharing or volume-purchase arrangements where applicable.\n\nMaintenance and Support. Dasta, not Apple, is responsible for providing any maintenance and support services for the Dasta mobile application as required by applicable law or these Terms. Apple has no obligation to furnish maintenance or support services.\n\nWarranty. To the extent any warranty applies to the Dasta mobile application and the application fails to conform to that warranty, you may notify Apple, and Apple may refund the purchase price, if any, paid to Apple for the application. To the maximum extent permitted by applicable law, Apple has no other warranty obligation with respect to the Dasta mobile application. Dasta is responsible for any other claims, losses, liabilities, damages, costs, or expenses attributable to a failure to conform to an applicable warranty, subject to these Terms and applicable law.\n\nProduct Claims. Dasta, not Apple, is responsible for addressing claims by you or any third party relating to the Dasta mobile application or your possession or use of it, including product-liability claims, claims that the application fails to conform to applicable legal or regulatory requirements, and claims arising under consumer-protection, privacy, or similar law.\n\nIntellectual Property Claims. If a third party claims that the Dasta mobile application or your possession and use of it infringes that party's intellectual-property rights, Dasta, not Apple, is responsible for the investigation, defense, settlement, and discharge of that claim.\n\nLegal Compliance. You represent and warrant that you are not located in a country or region subject to a U.S. Government embargo or designated by the U.S. Government as a \"terrorist supporting\" country or region, and that you are not listed on any U.S. Government list of prohibited or restricted parties.\n\nThird-Party Terms. You must comply with applicable third-party terms when using the Dasta mobile application, including terms applicable to your wireless-data service, device platform, authentication provider, and payment provider.\n\nThird-Party Beneficiary. Apple and Apple's subsidiaries are third-party beneficiaries of these Terms as they relate to the Dasta mobile application. Upon your acceptance of these Terms, Apple will have the right (and will be deemed to have accepted the right) to enforce these Terms against you as a third-party beneficiary.\n\nDeveloper Contact. Questions, complaints, or claims relating to the Dasta mobile application should be directed to Dasta using the contact information in Section 27.","heading":"26. Apple End User License Agreement Terms"},{"body":"Dasta LLC\n151 West Gorham Street, Madison, WI 53703\nEmail: support@dastacafe.com\n\nQuestions, complaints, or claims regarding the Dasta Services may be directed to the contact information above. Privacy-related requests may also be submitted using the methods described in the Dasta Privacy Policy.","heading":"27. Contact"}]} },
 };
 
 function useContentPage(slug) {
@@ -8464,7 +8588,6 @@ function PairingPanel({ pairing, drink, drinkName, price, selectedSize, customer
         pair_with_cart_item_id: drinkRes.data.cart_item_id,
       });
       if (foodRes.ok && foodRes.data?.success) {
-        showInfo('Wombo Combo! 🎉', `${name} (${selectedSize}oz) + ${best.food_name} — $${comboAmt.toFixed(2)} added to your order!`);
         navigation.navigate('Cart', { customer });
       } else {
         showInfo('Error', 'Could not add the full combo to your order.');
@@ -8482,7 +8605,6 @@ function PairingPanel({ pairing, drink, drinkName, price, selectedSize, customer
         description: best.pairing_reason || '', quantity: 1, unit_price_cents: Math.round(foodAmt * 100),
       });
       if (ok && data?.success) {
-        showInfo('Added to Cart 🍽', `${best.food_name} — $${foodAmt.toFixed(2)} added to your order!`);
         navigation.navigate('Cart', { customer });
       } else {
         showInfo('Error', 'Could not add to your order.');
@@ -8504,7 +8626,6 @@ function PairingPanel({ pairing, drink, drinkName, price, selectedSize, customer
       });
       if (ok && data?.success) {
         await craftIfNeeded(data.custom_drink_id);
-        showInfo('Added to Cart 🥤', `${name} (${selectedSize}oz) — $${drinkAmt.toFixed(2)} added to your order!`);
         navigation.navigate('Cart', { customer });
       } else {
         showInfo('Error', 'Could not add to your order.');
@@ -8678,8 +8799,8 @@ function CartScreen({ navigation, route }) {
     setLoading(false);
   };
   // Re-sync the header badge with the server whenever the cart opens
-  // (2026-10-01): a card checkout empties the cart from Stripe's webhook,
-  // which can land after the badge last refreshed, leaving it stuck at 1
+  // (2026-10-01): a card checkout can empty the cart server-side after
+  // the badge last refreshed, leaving it stuck at 1
   // over an empty cart.
   useEffect(() => { load(); cart?.refreshCounts?.(); }, []);
 
@@ -8893,18 +9014,94 @@ function CartScreen({ navigation, route }) {
   );
 }
 
+// Checkout tip buttons (Clover, 2026-10-08): percent of the pre-tax order
+// total after free drinks.
+const CHECKOUT_TIP_PCTS = [10, 15, 20];
+// Custom tip picker: two linked wheels, $ in $0.25 steps and % in 1%
+// steps, from 0 with no upper limit; every value carries its own unit.
+// The $ value is what's sent.
+const TIP_WHEEL_USD_STEP = 25; // cents
+const TIP_WHEEL_DRAG_PX = 20;  // swipe distance per step
+const CHECKOUT_COMPACT_H = 72; // free drink / Dasta Card boxes and the tip picker
+// % wheel: from a fractional % (set by the $ wheel) the first step lands on
+// the next whole percent in that direction.
+function stepTipPct(t, dir, base) {
+  const pct = Math.max(0, dir > 0 ? Math.floor(t.pct) + 1 : Math.ceil(t.pct) - 1);
+  return { pct, cents: Math.round(base * pct / 100) };
+}
+// $ wheel: off-step amounts (set by the % wheel) snap to the nearest $0.25
+// in the direction turned.
+function stepTipCents(t, dir, base) {
+  const next = dir > 0
+    ? Math.floor(t.cents / TIP_WHEEL_USD_STEP) * TIP_WHEEL_USD_STEP + TIP_WHEEL_USD_STEP
+    : Math.ceil(t.cents / TIP_WHEEL_USD_STEP) * TIP_WHEEL_USD_STEP - TIP_WHEEL_USD_STEP;
+  const cents = Math.max(0, next);
+  return { cents, pct: base ? cents / base * 100 : 0 };
+}
+const tipPctLabel = (pct) => (Number.isInteger(pct) ? `${pct}%` : `${pct.toFixed(1)}%`);
+
+// One wheel of the tip picker, iOS time-picker style: a small grey value
+// above (one step down), the selected value in the middle, a small grey
+// value below (one step up). Swipe up/down to turn it a step at a time,
+// or tap the value above/below. onDragging lets the screen stop its
+// ScrollView from stealing the swipe.
+function TipWheel({ above, value, below, onStep, onDragging, disabled, accessibilityLabel }) {
+  const latest = useRef({});
+  latest.current = { onStep, onDragging, disabled };
+  const anchor = useRef(0);
+  const responder = useRef(PanResponder.create({
+    onStartShouldSetPanResponder: () => !latest.current.disabled,
+    onMoveShouldSetPanResponder: () => !latest.current.disabled,
+    onPanResponderTerminationRequest: () => false,
+    onPanResponderGrant: () => { anchor.current = 0; latest.current.onDragging?.(true); },
+    onPanResponderMove: (_e, g) => {
+      let d = anchor.current - g.dy; // swipe up = larger values
+      while (d >= TIP_WHEEL_DRAG_PX) { latest.current.onStep(1); anchor.current -= TIP_WHEEL_DRAG_PX; d -= TIP_WHEEL_DRAG_PX; }
+      while (d <= -TIP_WHEEL_DRAG_PX) { latest.current.onStep(-1); anchor.current += TIP_WHEEL_DRAG_PX; d += TIP_WHEEL_DRAG_PX; }
+    },
+    onPanResponderRelease: () => latest.current.onDragging?.(false),
+    onPanResponderTerminate: () => latest.current.onDragging?.(false),
+  })).current;
+  const side = (dir, text) => (
+    <Pressable onPress={() => onStep(dir)} disabled={disabled || text == null} hitSlop={4}
+      style={{ height: 21, alignSelf: 'stretch', alignItems: 'center', justifyContent: 'center' }}>
+      <Text style={{ color: C.muted, fontSize: 11 }}>{text ?? ''}</Text>
+    </Pressable>
+  );
+  return (
+    <View {...responder.panHandlers} accessibilityRole="adjustable" accessibilityLabel={accessibilityLabel} accessibilityValue={{ text: value }}
+      accessibilityActions={[{ name: 'increment' }, { name: 'decrement' }]}
+      onAccessibilityAction={(e) => onStep(e.nativeEvent.actionName === 'increment' ? 1 : -1)}
+      style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
+      {side(-1, above)}
+      <View style={{ height: 28, justifyContent: 'center' }}>
+        <Text style={{ color: C.saffron, fontSize: 13, fontWeight: '700' }}>{value}</Text>
+      </View>
+      {side(1, below)}
+    </View>
+  );
+}
+
+// "VISA" / "visa" -> "Visa" for the collapsed new-card row.
+const CARD_BRAND_LABELS = { visa: 'Visa', mastercard: 'Mastercard', mc: 'Mastercard', amex: 'Amex', american_express: 'Amex', americanexpress: 'Amex', discover: 'Discover' };
+function cardBrandLabel(brand) {
+  if (!brand) return 'Card';
+  const k = String(brand).toLowerCase().replace(/\s+/g, '_');
+  return CARD_BRAND_LABELS[k] || CARD_BRAND_LABELS[k.replace(/_/g, '')] || `${k[0].toUpperCase()}${k.slice(1).replace(/_/g, ' ')}`;
+}
+
 // ── CHECKOUT ──────────────────────────────────────────────────
 // Native rebuild of your-order_embed3.html's Payment step — same
-// GET /checkout/summary + POST /checkout/confirm contract, presenting
-// Stripe's native PaymentSheet (via usePayWithSheet) instead of web's
-// Payment Element for the async (card_amount_cents > 0) branch. The
-// synchronous voucher/wallet-only branch (card_amount_cents === 0)
-// never touches Stripe at all, exactly like web. Scheduled pickup times
-// aren't built yet (ASAP only) — flagged, not silently declared done.
+// GET /checkout/summary + POST /checkout/confirm contract. Everything is
+// chosen on this one screen (no popups after Pay): a saved card is charged
+// by /checkout/confirm itself; a new card is entered inline (Clover card
+// fields, tokenized by "Use this card") and charged right after via
+// POST /payments/clover/confirm. A free-drinks/Dasta-Card-only order
+// never takes a card at all, exactly like web.
 function CheckoutScreen({ navigation, route, onHeaderBack }) {
   const customer = route?.params?.customer || null;
   const cart = useCart();
-  const payWithSheet = usePayWithSheet();
+  const payWithCard = usePayWithCard();
   const [loading, setLoading] = useState(true);
   const [summary, setSummary] = useState(null);
   const [voucherCount, setVoucherCount] = useState(0);
@@ -8919,6 +9116,7 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
   // own init ("!d.is_open_now ... scheduledTime = pickup_slots[0]").
   const [pickupType, setPickupType] = useState('asap');
   const [scheduledTime, setScheduledTime] = useState(null);
+  const [slotsOpen, setSlotsOpen] = useState(false); // inline pickup-time drop-down
   // Have a gift card? (2026-09-13, PC's ask) -- same POST /checkout/confirm
   // gift_card_number/gift_card_redeem_code fields checkout_router.py's
   // _redeem_gift_card-at-checkout branch already accepts; nothing new
@@ -8927,6 +9125,34 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
   const [giftCardNumber, setGiftCardNumber] = useState('');
   const [giftCardCode, setGiftCardCode] = useState('');
   const clientRequestId = useRef(`${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  // Pay with (Clover, 2026-10-08) -- your-order_embed1.html's "Charge
+  // remainder to": a saved card's card_ref, or 'new' for a card entered
+  // inline below.
+  const [selectedTender, setSelectedTender] = useState('new');
+  // Inline new card: CloverCardFields until "Use this card" tokenizes it,
+  // then {token, card} (shown collapsed). cardFieldsKey remounts empty fields.
+  const cardFieldsRef = useRef(null);
+  const [cardFieldsKey, setCardFieldsKey] = useState(0);
+  const [cardFieldsReady, setCardFieldsReady] = useState(false);
+  const [newCard, setNewCard] = useState(null); // {token, card}
+  const [tokenizing, setTokenizing] = useState(false);
+  const [saveNewCard, setSaveNewCard] = useState(false);
+  const [cardError, setCardError] = useState('');
+  const [payError, setPayError] = useState('');
+  const [payLocked, setPayLocked] = useState(false); // 409: an earlier Pay is still being charged
+  // Tip (inline, Clover 2026-10-08): 0 (No tip) | 10 | 15 | 20 | 'custom'.
+  // Custom is two linked dials, {pct, cents}; cents is what's sent.
+  const [tipChoice, setTipChoice] = useState(10);
+  const [customTip, setCustomTip] = useState({ pct: 10, cents: 0 });
+  const [dialDragging, setDialDragging] = useState(false);
+  // Gift card fields kept above the keyboard (see focusGiftField).
+  const scrollRef = useRef(null);
+  const scrollY = useRef(0);
+  const contentY = useRef(0);   // padded content View's y in the ScrollView
+  const giftBlockY = useRef(0); // gift card block's y in that View
+  const giftBlockRef = useRef(null);
+  const giftCodeRef = useRef(null);
+  const giftFocused = useRef(false);
   // My Circles group order (2026-09-27) -- when set, pickup is the group's
   // shared time (no ASAP/schedule choice) and group_order_id rides along
   // with /checkout/confirm, which re-checks the join cutoff server-side.
@@ -9005,6 +9231,17 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
     showInfo(title, message, () => navigation.navigate('MainTabs', { initialTab: 'Home' }));
   };
 
+  // A saved card's ref: card_ref, or the older stripe_pm_id name for the
+  // same Clover card ref until the API drops it.
+  const cardRefOf = (c) => c.card_ref || c.stripe_pm_id;
+  // Same default as web: summary.default_tender, else the first saved card,
+  // else a new card.
+  const defaultTender = (s) => {
+    const cards = s.saved_cards || [];
+    if (s.default_tender && cards.some(c => cardRefOf(c) === s.default_tender)) return s.default_tender;
+    return cards[0] ? cardRefOf(cards[0]) : 'new';
+  };
+
   const load = async () => {
     setLoading(true);
     const { ok, data } = await apiFetch('/checkout/summary');
@@ -9012,6 +9249,7 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
       setSummary(data);
       setVoucherCount(data.voucher_default_count || 0);
       setUseWallet(!!data.wallet?.default_checked);
+      setSelectedTender(defaultTender(data));
       if (!data.is_open_now && data.pickup_slots?.length) {
         setPickupType('scheduled');
         setScheduledTime(data.pickup_slots[0]);
@@ -9021,10 +9259,23 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
   };
   useEffect(() => { load(); }, []);
 
-  const formatSlot = (iso) => {
-    const dt = new Date(iso);
-    return dt.toLocaleString('en-US', { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+  // Pickup slots: "Fri 2:00 PM" on the button; in the drop-down, a day
+  // header (Today / Tomorrow / "Sat Oct 11") over "2:00 PM" rows.
+  const slotTime = (iso) => new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  const slotButtonLabel = (iso) => `${new Date(iso).toLocaleDateString('en-US', { weekday: 'short' })} ${slotTime(iso)}`;
+  const slotDayLabel = (iso) => {
+    const d = new Date(iso), today = new Date();
+    const dayDiff = Math.round((new Date(d.getFullYear(), d.getMonth(), d.getDate()) - new Date(today.getFullYear(), today.getMonth(), today.getDate())) / 86400000);
+    if (dayDiff === 0) return 'Today';
+    if (dayDiff === 1) return 'Tomorrow';
+    return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }).replace(',', '');
   };
+  const slotGroups = (summary?.pickup_slots || []).reduce((groups, iso) => {
+    const day = slotDayLabel(iso);
+    const last = groups[groups.length - 1];
+    if (last && last.day === day) last.slots.push(iso); else groups.push({ day, slots: [iso] });
+    return groups;
+  }, []);
 
   // Multi-voucher fix (2026-09-13, PC's live report) -- total_cents_with_
   // voucher/tax_cents_with_voucher are a fixed count=1 preview (see
@@ -9036,18 +9287,96 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
   const voucherPreview = summary?.voucher_previews?.[voucherCount] ?? summary?.voucher_previews?.[0];
   const totalCents = voucherPreview?.total_cents ?? summary?.total_cents_no_voucher;
   const taxCents = voucherPreview?.tax_cents ?? summary?.tax_cents_no_voucher;
+  // Tip + remainder, as web's yoComputeWaterfall: the tip is a percent of
+  // the pre-tax subtotal BEFORE free-drink discounts (items at full price),
+  // so a free drink still gets a tip; it's added on top of the order, then
+  // Dasta Card covers what it can and a card pays the rest.
+  const tipsOn = !!summary?.tips_enabled;
+  const tipBaseCents = summary?.subtotal_cents || 0;
+  const freeDrinkCents = voucherCount > 0 ? (voucherPreview?.discount_cents || 0) : 0;
+  const tipFor = (pct) => Math.round(tipBaseCents * pct / 100);
+  const tipCents = !tipsOn ? 0 : tipChoice !== 'custom' ? tipFor(tipChoice) : customTip.cents;
+  const tipOverBase = tipCents > tipBaseCents; // a note only; Pay still works
+  const tipPctNow = tipChoice === 'custom' ? customTip.pct : tipChoice;
+  const orderTotalCents = (totalCents || 0) + tipCents;
+  const walletApplied = useWallet && summary?.wallet && orderTotalCents > 0
+    ? Math.min(summary.wallet.total_cents || 0, orderTotalCents) : 0;
+  const cardAmountCents = orderTotalCents - walletApplied;
+  const fmt = (cents) => `$${((cents || 0) / 100).toFixed(2)}`;
+  // The custom picker always opens at 10%. If the base changes, keep the %
+  // and recompute the $.
+  const tipBaseRef = useRef(tipBaseCents);
+  tipBaseRef.current = tipBaseCents;
+  const chooseTip = (val) => {
+    if (val === 'custom' && tipChoice !== 'custom') setCustomTip({ pct: 10, cents: tipFor(10) });
+    setTipChoice(val); setPayError('');
+  };
+  useEffect(() => {
+    setCustomTip(t => {
+      const cents = Math.round(tipBaseCents * t.pct / 100);
+      return cents === t.cents ? t : { ...t, cents };
+    });
+  }, [tipBaseCents]);
+  const stepPctWheel = (dir) => setCustomTip(t => stepTipPct(t, dir, tipBaseRef.current));
+  const stepUsdWheel = (dir) => setCustomTip(t => stepTipCents(t, dir, tipBaseRef.current));
+
+  // Gift card fields: scroll the whole block (both fields) above the
+  // keyboard on focus, then once more if the real keyboard still covers it.
+  const focusGiftField = () => {
+    giftFocused.current = true;
+    setTimeout(() => {
+      scrollRef.current?.scrollTo({ y: Math.max(0, contentY.current + giftBlockY.current - 24), animated: true });
+    }, 250);
+  };
+  useEffect(() => {
+    const sub = Keyboard.addListener('keyboardDidShow', (e) => {
+      if (!giftFocused.current || !giftBlockRef.current) return;
+      const kbTop = e.endCoordinates.screenY;
+      giftBlockRef.current.measureInWindow((_x, y, _w, h) => {
+        const overlap = y + h + 16 - kbTop;
+        if (overlap > 0) scrollRef.current?.scrollTo({ y: scrollY.current + overlap, animated: true });
+      });
+    });
+    return () => sub.remove();
+  }, []);
+
+  // "Use this card": tokenize the inline fields and collapse them.
+  const tokenizeNewCard = async () => {
+    if (!cardFieldsRef.current) return null;
+    setTokenizing(true); setCardError('');
+    const t = await cardFieldsRef.current.tokenize();
+    setTokenizing(false);
+    if (!t.ok) { setCardError(t.error || 'Please check your card details.'); return null; }
+    const nc = { token: t.token, card: t.card };
+    setNewCard(nc);
+    return nc;
+  };
+  // "Change" (or a decline): back to empty fields.
+  const reopenCardFields = () => {
+    setNewCard(null); setCardFieldsReady(false); setCardFieldsKey(k => k + 1);
+  };
 
   // goOverride: the group order just joined from the safety-net prompt
   // (the context update hasn't re-rendered yet).
   const handlePay = async (goOverride) => {
     const go = goOverride?.group_order_id ? goOverride : groupOrder;
-    if (!go && pickupType === 'scheduled' && !scheduledTime) { showInfo('Pick a time', 'Please choose a pickup time.'); return; }
+    if (!go && pickupType === 'scheduled' && !scheduledTime) { setPayError('Please choose a pickup time.'); return; }
     if ((giftCardNumber.trim() || giftCardCode.trim()) && !(giftCardNumber.trim() && giftCardCode.trim())) {
-      showInfo('Gift Card', 'Please enter both the gift card number and its redemption code.');
+      setPayError('Please enter both the gift card number and its redemption code.');
       return;
     }
+    // A new card must be entered before Pay; if the fields are filled in
+    // but "Use this card" wasn't tapped, tokenize them now.
+    let card = selectedTender === 'new' ? newCard : null;
+    if (cardAmountCents > 0 && selectedTender === 'new' && !card) {
+      if (!cardFieldsReady) { setPayError('Enter your card details above.'); return; }
+      setPaying(true); setPayError('');
+      card = await tokenizeNewCard();
+      setPaying(false);
+      if (!card) { setPayError('Please check your card details above.'); return; }
+    }
     if (!go && groupOffer && !groupOfferDeclined.current) { setGroupOfferOpen(true); return; }
-    setPaying(true);
+    setPaying(true); setPayError('');
     try {
       const { ok, data } = await apiFetch('/checkout/confirm', {
         method: 'POST',
@@ -9059,9 +9388,13 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
           pickup_name: pickupName || undefined, client_request_id: clientRequestId.current,
           gift_card_number: giftCardNumber.trim() || undefined,
           gift_card_redeem_code: giftCardCode.trim() || undefined,
+          // A saved card is charged server-side right away; left out for a
+          // new card, which is charged next via /payments/clover/confirm.
+          card_ref: selectedTender !== 'new' ? selectedTender : undefined,
+          tip_cents: tipCents,
         },
       });
-      if (!ok) { showInfo('Error', data?.detail || 'Could not place your order.'); return; }
+      if (!ok) { setPayError(data?.detail || 'Could not place your order.'); return; }
       if (data.status === 'confirmed') {
         cart.refreshCounts();
         // onOk defers the navigate() until the InfoModal is dismissed --
@@ -9071,18 +9404,50 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
         afterPaid('Order Placed! ☕', 'Your order has been confirmed.', go);
         return;
       }
-      if (data.client_secret) {
-        const result = await payWithSheet({ clientSecret: data.client_secret, customerSessionClientSecret: data.customer_session_client_secret, customerId: data.stripe_customer_id });
-        if (result.canceled) return;
-        if (!result.ok) { showInfo('Payment Error', result.error || 'Could not complete payment.'); return; }
-        // The cart is cleared by the Stripe webhook, usually a second or
-        // two after the sheet reports success -- check again shortly after.
+      // The cart may be cleared server-side a moment after the payment
+      // reports success -- check again shortly after.
+      const paid = () => {
         cart.refreshCounts();
         setTimeout(() => cart.refreshCounts(), 2500);
         setTimeout(() => cart.refreshCounts(), 6000);
         afterPaid('Order Placed! ☕', 'Payment received — your order is confirmed.', go);
+      };
+      // Saved card charged (or, for a group order, authorized) server-side
+      // -- nothing left for the customer to do.
+      if (data.payment_status === 'succeeded' || data.payment_status === 'requires_capture') { paid(); return; }
+      if (data.clover && data.payment_ref) {
+        // New card entered above: charge it now, no card sheet. Success also
+        // covers status authorized (a group-order hold).
+        if (card) {
+          const res = await apiFetch('/payments/clover/confirm', {
+            method: 'POST',
+            body: { payment_ref: data.payment_ref, token: card.token, card: card.card, save_card: saveNewCard },
+            timeoutMs: 45000,
+          });
+          if (res.ok && res.data?.success) { paid(); return; }
+          if (res.status === 409) {
+            setPayLocked(true);
+            setPayError(`${res.data?.detail || 'This payment is already being processed.'} Check your order history in a minute.`);
+            return;
+          }
+          // Declined or expired token: fresh fields, Pay again (same
+          // client_request_id, so it's still the same order).
+          reopenCardFields();
+          setPayError(res.data?.detail || (res.networkError
+            ? "We couldn't reach Dasta to confirm your payment. Please check your connection and try again."
+            : 'Your card could not be charged. Please re-enter it and try again.'));
+          return;
+        }
+        // No card entered here (e.g. Dasta Card or a gift card looked like
+        // enough, but the server still wants a card) -- fall back to the sheet.
+        const result = await payWithCard(data);
+        if (result.canceled) return;
+        if (!result.ok) { setPayError(result.error || 'Could not complete payment.'); return; }
+        paid();
+        return;
       }
-    } catch { showInfo('Error', 'Could not reach Dasta server.'); }
+      setPayError(data.detail || 'Could not start your payment. Please try again.');
+    } catch { setPayError('Could not reach Dasta server.'); }
     finally { setPaying(false); }
   };
 
@@ -9092,8 +9457,14 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
 
   return (
     <>
-    <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-    <ScrollView style={S.screen} pinchGestureEnabled maximumZoomScale={3} minimumZoomScale={1} bouncesZoom keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag" contentContainerStyle={{ paddingBottom: 60 }}>
+    {/* iOS: the ScrollView insets itself for the keyboard
+        (automaticallyAdjustKeyboardInsets), so no KeyboardAvoidingView
+        padding on top of it. Android: 'height' with app.json's
+        softwareKeyboardLayoutMode "resize". */}
+    <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? undefined : 'height'}>
+    <ScrollView ref={scrollRef} style={S.screen} pinchGestureEnabled maximumZoomScale={3} minimumZoomScale={1} bouncesZoom keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag" contentContainerStyle={{ paddingBottom: 60 }}
+      automaticallyAdjustKeyboardInsets scrollEnabled={!dialDragging}
+      onScroll={(e) => { scrollY.current = e.nativeEvent.contentOffset.y; }} scrollEventThrottle={16}>
       <StatusBar style="light" />
       {/* Back-chevron removed (2026-09-23, PC's ask, app-wide audit) --
           Home tab is enough everywhere, arrow or not. */}
@@ -9101,7 +9472,7 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
         <HeroTitleRow title="Checkout" onBack={onHeaderBack} />
       </View>
 
-      <View style={{ padding: 16 }}>
+      <View style={{ padding: 16 }} onLayout={(e) => { contentY.current = e.nativeEvent.layout.y; }}>
         <GroupOrderBanner onCancel={leaveGroupCheckout} />
         {/* Order Items (2026-09-19, PC's live report) -- checkout used to
             jump straight to Subtotal/Tax/Total with no line items at all.
@@ -9137,30 +9508,129 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
           </>
         )}
 
-        {summary.available_vouchers > 0 && (
-          <View style={[S.rewardVoucherBox, { marginTop: 12 }]}>
-            <Text style={S.rewardVoucherText}>🏆 {summary.available_vouchers} Free Drink{summary.available_vouchers > 1 ? 's' : ''} available</Text>
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 14, marginTop: 8 }}>
-              <Pressable onPress={() => setVoucherCount(c => Math.max(0, c - 1))} style={S.qtyBtn}><Text style={S.qtyBtnText}>−</Text></Pressable>
-              <Text style={{ fontWeight: '700' }}>{voucherCount} applied</Text>
-              <Pressable onPress={() => setVoucherCount(c => Math.min(summary.max_vouchers_applicable || 0, c + 1))} style={S.qtyBtn}><Text style={S.qtyBtnText}>+</Text></Pressable>
+        {/* Free drinks and Dasta Card side by side, same compact height. */}
+        {(summary.available_vouchers > 0 || summary.wallet?.total_cents > 0) && (
+          <View style={{ flexDirection: 'row', gap: 10, marginTop: 12 }}>
+            {summary.available_vouchers > 0 && (() => {
+              const max = summary.max_vouchers_applicable || 0;
+              const canDown = voucherCount > 0, canUp = voucherCount < max;
+              return (
+                <View style={[S.checkoutHalfBox, { justifyContent: 'space-between' }]}>
+                  <Text style={S.checkoutHalfTitle} numberOfLines={1}>Free Drink(s)</Text>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+                    <Pressable onPress={() => setVoucherCount(c => Math.max(0, c - 1))} disabled={!canDown || paying}
+                      accessibilityLabel="One fewer free drink" style={[S.qtyBtn, !canDown && { opacity: 0.35 }]}><Text style={S.qtyBtnText}>−</Text></Pressable>
+                    <Text style={{ fontWeight: '700', color: C.charcoal, minWidth: 14, textAlign: 'center' }}>{voucherCount}</Text>
+                    <Pressable onPress={() => setVoucherCount(c => Math.min(max, c + 1))} disabled={!canUp || paying}
+                      accessibilityLabel="One more free drink" style={[S.qtyBtn, !canUp && { opacity: 0.35 }]}><Text style={S.qtyBtnText}>+</Text></Pressable>
+                  </View>
+                </View>
+              );
+            })()}
+            {summary.wallet?.total_cents > 0 && (
+              <Pressable style={[S.checkoutHalfBox, { justifyContent: 'space-between' }]} onPress={() => setUseWallet(v => !v)} disabled={paying}
+                accessibilityRole="switch" accessibilityState={{ checked: useWallet }}>
+                <Text style={S.checkoutHalfTitle} numberOfLines={1}>Use Dasta Card</Text>
+                <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <Text style={{ color: C.black, fontSize: 13 }}>{fmt(summary.wallet.total_cents)}</Text>
+                  <Switch value={useWallet} onValueChange={setUseWallet} disabled={paying} trackColor={{ false: C.muted, true: C.saffron }} ios_backgroundColor={C.muted} thumbColor={C.white} />
+                </View>
+              </Pressable>
+            )}
+          </View>
+        )}
+
+        {/* Pay with -- shown whenever free drinks and Dasta Card leave
+            something to pay, same rule as web's "Charge remainder to". */}
+        {cardAmountCents > 0 && (
+          <View style={{ marginTop: 16 }}>
+            <Text style={S.fieldLabel}>Pay with</Text>
+            <View style={{ backgroundColor: C.white, borderRadius: 10, overflow: 'hidden' }}>
+              {[...(summary.saved_cards || []).map(c => ({ value: cardRefOf(c), label: c.display })),
+                { value: 'new', label: 'Use a new card' }].map((t, i) => {
+                const on = selectedTender === t.value;
+                return (
+                  <Pressable key={t.value} disabled={paying} onPress={() => { if (t.value === 'new' && selectedTender !== 'new') setCardFieldsReady(false); setSelectedTender(t.value); setPayError(''); }}
+                    accessibilityRole="radio" accessibilityState={{ checked: on }}
+                    style={[S.profileMenuRow, { gap: 10 }, i > 0 && { borderTopWidth: 1, borderTopColor: C.border }]}>
+                    <Ionicons name={on ? 'radio-button-on' : 'radio-button-off'} size={20} color={on ? C.saffron : C.muted} />
+                    <Text style={[S.profileMenuRowText, { flex: 1 }]}>{t.label}</Text>
+                  </Pressable>
+                );
+              })}
+              {selectedTender === 'new' && (
+                <View style={{ paddingHorizontal: 16, paddingBottom: 14, borderTopWidth: 1, borderTopColor: C.border }}>
+                  {newCard ? (
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingTop: 12 }}>
+                      <Ionicons name="card-outline" size={20} color={C.saffron} />
+                      <Text style={[S.profileMenuRowText, { flex: 1 }]}>
+                        {cardBrandLabel(newCard.card?.brand)} •••• {newCard.card?.last4 || '····'} (new card)
+                      </Text>
+                      <Pressable onPress={reopenCardFields} disabled={paying} hitSlop={8}>
+                        <Text style={[S.linkText, { marginTop: 0 }]}>Change</Text>
+                      </Pressable>
+                    </View>
+                  ) : (
+                    <>
+                      <CloverCardFields key={cardFieldsKey} ref={cardFieldsRef} onReady={() => setCardFieldsReady(true)} />
+                      <Pressable style={[S.btnSaffron, { marginTop: 10, marginBottom: 0 }, (!cardFieldsReady || tokenizing || paying) && { opacity: 0.6 }]}
+                        disabled={!cardFieldsReady || tokenizing || paying} onPress={() => { setPayError(''); tokenizeNewCard(); }}>
+                        {tokenizing ? <ActivityIndicator color={C.ivory} /> : <Text style={S.btnSaffronText}>Use this card</Text>}
+                      </Pressable>
+                    </>
+                  )}
+                  {!!cardError && !newCard && <Text style={{ color: '#C0392B', marginTop: 8 }}>{cardError}</Text>}
+                  <Pressable disabled={paying} onPress={() => setSaveNewCard(v => !v)}
+                    accessibilityRole="checkbox" accessibilityState={{ checked: saveNewCard }}
+                    style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingTop: 12 }}>
+                    <Ionicons name={saveNewCard ? 'checkbox' : 'square-outline'} size={20} color={saveNewCard ? C.saffron : C.muted} />
+                    <Text style={S.profileMenuRowText}>Save this card for next time</Text>
+                  </Pressable>
+                </View>
+              )}
             </View>
           </View>
         )}
 
-        {summary.wallet?.total_cents > 0 && (
-          <Pressable style={[S.profileMenuRow, { justifyContent: 'space-between', backgroundColor: C.white, borderRadius: 10, marginTop: 12 }]}
-            onPress={() => setUseWallet(v => !v)}>
-            <Text style={S.profileMenuRowText}>Use Dasta Cash (${(summary.wallet.total_cents / 100).toFixed(2)})</Text>
-            <Switch value={useWallet} onValueChange={setUseWallet} trackColor={{ false: C.border, true: C.saffron }} thumbColor={C.white} />
-          </Pressable>
+        {/* Add a tip -- inline (no popup). Percent of the pre-tax order
+            total after free drinks; exactly one choice, 10% to start. One
+            row of five compact buttons (fits a 360dp-wide phone). */}
+        {tipsOn && (
+          <View style={{ marginTop: 16 }}>
+            <Text style={S.fieldLabel}>Add a tip</Text>
+            <View style={{ flexDirection: 'row', gap: 6 }}>
+              {[{ val: 0, label: 'No tip' },
+                ...CHECKOUT_TIP_PCTS.map(p => ({ val: p, label: `${p}%` })),
+                { val: 'custom', label: 'Custom' }].map(o => {
+                const on = tipChoice === o.val;
+                return (
+                  <Pressable key={String(o.val)} disabled={paying} onPress={() => chooseTip(o.val)}
+                    accessibilityRole="radio" accessibilityState={{ checked: on }}
+                    style={{ flex: 1, height: 44, borderRadius: 10, alignItems: 'center', justifyContent: 'center',
+                      paddingHorizontal: 2, borderWidth: 1.5, borderColor: on ? C.saffron : C.border, backgroundColor: on ? C.saffron : C.white }}>
+                    <Text style={{ color: on ? C.white : C.charcoal, fontSize: 13, fontWeight: '700' }} numberOfLines={1} adjustsFontSizeToFit>{o.label}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+            {tipChoice === 'custom' && (
+              <View style={{ height: CHECKOUT_COMPACT_H, marginTop: 10, flexDirection: 'row', borderRadius: 10, borderWidth: 1, borderColor: C.border, backgroundColor: C.white, overflow: 'hidden' }}>
+                {/* Selection band across the middle, behind both wheels. */}
+                <View pointerEvents="none" style={{ position: 'absolute', left: 6, right: 6, top: (CHECKOUT_COMPACT_H - 2 - 28) / 2, height: 28,
+                  borderRadius: 8, borderWidth: 1, borderColor: C.saffron, backgroundColor: '#FDEDE3' }} />
+                <TipWheel accessibilityLabel="tip amount" disabled={paying} onStep={stepUsdWheel} onDragging={setDialDragging}
+                  above={customTip.cents > 0 ? fmt(stepTipCents(customTip, -1, tipBaseCents).cents) : null}
+                  value={fmt(customTip.cents)}
+                  below={fmt(stepTipCents(customTip, 1, tipBaseCents).cents)} />
+                <TipWheel accessibilityLabel="tip percent" disabled={paying} onStep={stepPctWheel} onDragging={setDialDragging}
+                  above={customTip.pct > 0 ? tipPctLabel(stepTipPct(customTip, -1, tipBaseCents).pct) : null}
+                  value={tipPctLabel(customTip.pct)}
+                  below={tipPctLabel(stepTipPct(customTip, 1, tipBaseCents).pct)} />
+              </View>
+            )}
+            {tipOverBase && <Text style={{ color: C.saffron, fontSize: 12, marginTop: 6 }}>The tip is more than the order itself</Text>}
+          </View>
         )}
-
-        <View style={{ marginTop: 20, gap: 6 }}>
-          <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={S.cardSub}>Subtotal</Text><Text style={S.cardSub}>${(summary.subtotal_cents / 100).toFixed(2)}</Text></View>
-          <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={S.cardSub}>Tax</Text><Text style={S.cardSub}>${((taxCents || 0) / 100).toFixed(2)}</Text></View>
-          <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 4 }}><Text style={S.secTitle}>Total</Text><Text style={S.secTitle}>${((totalCents || 0) / 100).toFixed(2)}</Text></View>
-        </View>
 
         {groupOrder ? (
           <>
@@ -9173,26 +9643,41 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
           <Pressable
             disabled={summary.is_open_now === false}
             style={[S.pickupPill, pickupType === 'asap' && S.pickupPillActive, summary.is_open_now === false && S.pickupPillDisabled]}
-            onPress={() => setPickupType('asap')}>
-            <Text style={[S.pickupPillText, pickupType === 'asap' && S.pickupPillTextActive]}>ASAP</Text>
-            {summary.is_open_now !== false && <Text style={[S.pickupPillSub, pickupType === 'asap' && S.pickupPillTextActive]}>Ready in 10 min</Text>}
+            onPress={() => { setPickupType('asap'); setSlotsOpen(false); }}>
+            <Text style={[S.pickupPillText, pickupType === 'asap' && S.pickupPillTextActive]} numberOfLines={1} adjustsFontSizeToFit>
+              {summary.is_open_now !== false ? 'ASAP · in 10–15 min' : 'ASAP (7am–7pm daily)'}
+            </Text>
           </Pressable>
-          <Pressable style={[S.pickupPill, pickupType === 'scheduled' && S.pickupPillActive]} onPress={() => setPickupType('scheduled')}>
-            <Text style={[S.pickupPillText, pickupType === 'scheduled' && S.pickupPillTextActive]}>Schedule for later</Text>
+          <Pressable style={[S.pickupPill, pickupType === 'scheduled' && S.pickupPillActive]} onPress={() => setSlotsOpen(v => !v)}
+            accessibilityState={{ expanded: slotsOpen }}>
+            <Text style={[S.pickupPillText, pickupType === 'scheduled' && S.pickupPillTextActive]} numberOfLines={1} adjustsFontSizeToFit>
+              {pickupType === 'scheduled' && scheduledTime ? `Pick up at ${slotButtonLabel(scheduledTime)} ▾` : 'Schedule for later'}
+            </Text>
           </Pressable>
         </View>
-        {summary.is_open_now === false && (
-          <Text style={S.fieldHint}>We're open 7am–7pm daily — pick a time below.</Text>
-        )}
-        {pickupType === 'scheduled' && (
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 10 }} contentContainerStyle={{ gap: 8 }}>
-            {(summary.pickup_slots || []).map(iso => (
-              <Pressable key={iso} onPress={() => setScheduledTime(iso)}
-                style={[S.menuCatTab, scheduledTime === iso && S.menuCatTabActive]}>
-                <Text style={[S.menuCatTabText, scheduledTime === iso && S.menuCatTabTextActive]}>{formatSlot(iso)}</Text>
-              </Pressable>
-            ))}
-          </ScrollView>
+        {slotsOpen && (
+          <View style={{ marginTop: 8, borderRadius: 10, borderWidth: 1, borderColor: C.border, backgroundColor: C.white, overflow: 'hidden' }}>
+            <RNScrollView style={{ maxHeight: 5 * 40 }} nestedScrollEnabled keyboardShouldPersistTaps="handled">
+              {slotGroups.length === 0 && (
+                <Text style={{ color: C.black, fontSize: 13, padding: 12 }}>No pickup times available right now.</Text>
+              )}
+              {slotGroups.map(g => (
+                <View key={g.day}>
+                  <Text style={{ color: C.charcoal, fontSize: 12, fontWeight: '700', paddingHorizontal: 12, paddingTop: 8, paddingBottom: 4, backgroundColor: C.ivory }}>{g.day}</Text>
+                  {g.slots.map(iso => {
+                    const on = pickupType === 'scheduled' && scheduledTime === iso;
+                    return (
+                      <Pressable key={iso} onPress={() => { setScheduledTime(iso); setPickupType('scheduled'); setSlotsOpen(false); setPayError(''); }}
+                        accessibilityRole="radio" accessibilityState={{ checked: on }}
+                        style={{ height: 40, justifyContent: 'center', paddingHorizontal: 12, backgroundColor: on ? C.saffron : C.white }}>
+                        <Text style={{ color: on ? C.white : C.charcoal, fontSize: 14, fontWeight: on ? '700' : '400' }}>{slotTime(iso)}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              ))}
+            </RNScrollView>
+          </View>
         )}
         </>)}
 
@@ -9200,17 +9685,39 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
           <Text style={S.linkText}>{giftCardOpen ? '▲' : '▼'} Have a gift card?</Text>
         </Pressable>
         {giftCardOpen && (
-          <View style={{ marginTop: 8 }}>
+          <View ref={giftBlockRef} collapsable={false} style={{ marginTop: 8 }}
+            onLayout={(e) => { giftBlockY.current = e.nativeEvent.layout.y; }}>
             <TextInput style={S.input} value={giftCardNumber} onChangeText={setGiftCardNumber}
-              placeholder="Gift card number" placeholderTextColor={C.muted} autoCapitalize="none" />
-            <TextInput style={S.input} value={giftCardCode} onChangeText={setGiftCardCode}
-              placeholder="Redemption code" placeholderTextColor={C.muted} autoCapitalize="characters" />
+              placeholder="Gift card number" placeholderTextColor={C.muted} autoCapitalize="none"
+              returnKeyType="next" blurOnSubmit={false} onSubmitEditing={() => giftCodeRef.current?.focus()}
+              onFocus={focusGiftField} onBlur={() => { giftFocused.current = false; }} />
+            <TextInput ref={giftCodeRef} style={S.input} value={giftCardCode} onChangeText={setGiftCardCode}
+              placeholder="Redemption code" placeholderTextColor={C.muted} autoCapitalize="characters"
+              returnKeyType="done" onSubmitEditing={() => Keyboard.dismiss()}
+              onFocus={focusGiftField} onBlur={() => { giftFocused.current = false; }} />
           </View>
         )}
 
-        <Pressable style={[S.btnSaffron, { marginTop: 20 }]} disabled={paying} onPress={() => handlePay()}>
+
+        <View style={{ marginTop: 20, gap: 2 }}>
+          <View style={S.checkoutTotalRow}><Text style={S.checkoutTotalText}>Subtotal</Text><Text style={S.checkoutTotalText}>{fmt(summary.subtotal_cents)}</Text></View>
+          {freeDrinkCents > 0 && (
+            <View style={S.checkoutTotalRow}>
+              <Text style={[S.checkoutTotalText, { color: '#2a8f4f' }]}>Free drink{voucherCount > 1 ? 's' : ''}</Text>
+              <Text style={[S.checkoutTotalText, { color: '#2a8f4f' }]}>−{fmt(freeDrinkCents)}</Text>
+            </View>
+          )}
+          <View style={S.checkoutTotalRow}><Text style={S.checkoutTotalText}>Tax</Text><Text style={S.checkoutTotalText}>{fmt(taxCents)}</Text></View>
+          {tipsOn && (
+            <View style={S.checkoutTotalRow}><Text style={S.checkoutTotalText}>Tip ({tipPctLabel(tipPctNow)})</Text><Text style={S.checkoutTotalText}>{fmt(tipCents)}</Text></View>
+          )}
+          <View style={[S.checkoutTotalRow, { marginTop: 2 }]}><Text style={[S.secTitle, { fontSize: 17 }]}>Total</Text><Text style={[S.secTitle, { fontSize: 17 }]}>{fmt(orderTotalCents)}</Text></View>
+        </View>
+
+        {!!payError && <Text style={{ color: '#C0392B', marginTop: 16, textAlign: 'center' }}>{payError}</Text>}
+        <Pressable style={[S.btnSaffron, { marginTop: 20 }, payLocked && { opacity: 0.6 }]} disabled={paying || payLocked} onPress={() => handlePay()}>
           {paying ? <ActivityIndicator color={C.ivory} /> : (
-            <Text style={S.btnSaffronText}>{(totalCents || 0) === 0 ? '✅ Place Order' : `💳 Pay $${((totalCents || 0) / 100).toFixed(2)}`}</Text>
+            <Text style={S.btnSaffronText}>{orderTotalCents === 0 ? '✅ Place Order' : `Pay ${fmt(orderTotalCents)}`}</Text>
           )}
         </Pressable>
       </View>
@@ -9260,7 +9767,7 @@ function CheckoutScreen({ navigation, route, onHeaderBack }) {
 function GiftDraftScreen({ navigation, route, onHeaderBack }) {
   const customer = route?.params?.customer || null;
   const cart = useCart();
-  const payWithSheet = usePayWithSheet();
+  const payWithCard = usePayWithCard();
   const [loading, setLoading] = useState(true);
   const [draft, setDraft] = useState(null);
   const [recipientName, setRecipientName] = useState('');
@@ -9348,7 +9855,7 @@ function GiftDraftScreen({ navigation, route, onHeaderBack }) {
     try {
       const { ok, data } = await apiFetch('/gift-orders/draft/checkout-intent', { method: 'POST' });
       if (!ok) { showInfo('Error', data?.detail || 'Could not start payment.'); return; }
-      const result = await payWithSheet({ clientSecret: data.client_secret, customerSessionClientSecret: data.customer_session_client_secret, customerId: data.stripe_customer_id });
+      const result = await payWithCard(data);
       if (result.canceled) return;
       if (!result.ok) { showInfo('Payment Error', result.error || 'Could not complete payment.'); return; }
       cart.refreshCounts();
@@ -9469,11 +9976,11 @@ function GiftDraftScreen({ navigation, route, onHeaderBack }) {
 // ── ADD MONEY TO DASTA CARD ───────────────────────────────────
 // Native rebuild of the Add Money flow this app's My Circle Account tile
 // only ever linked out to the website for — same POST /wallet/reload
-// contract (fixed $10/$25/$50 presets or a custom amount), PaymentSheet
-// for the actual charge.
+// contract (fixed $10/$25/$50 presets or a custom amount), the Clover
+// card sheet for the actual charge.
 function AddMoneyScreen({ navigation, route, onHeaderBack }) {
   const customer = route?.params?.customer || null;
-  const payWithSheet = usePayWithSheet();
+  const payWithCard = usePayWithCard();
   const PRESETS = [1000, 2500, 5000]; // cents — $10/$25/$50, matches wallet_router.py's RELOAD_PRESET_CENTS
   const [amountCents, setAmountCents] = useState(1000);
   const [customAmount, setCustomAmount] = useState('');
@@ -9494,7 +10001,7 @@ function AddMoneyScreen({ navigation, route, onHeaderBack }) {
     try {
       const { ok, data } = await apiFetch('/wallet/reload', { method: 'POST', body: { amount_cents: effectiveAmount } });
       if (!ok) { showInfo('Error', data?.detail || 'Could not start reload.'); return; }
-      const result = await payWithSheet({ clientSecret: data.client_secret, customerSessionClientSecret: data.customer_session_client_secret, customerId: data.stripe_customer_id });
+      const result = await payWithCard(data);
       if (result.canceled) return;
       if (!result.ok) { showInfo('Payment Error', result.error || 'Could not complete payment.'); return; }
       showInfo('Dasta Card Reloaded! 💵', `$${(effectiveAmount / 100).toFixed(2)} is on its way to your Dasta Card.`,
@@ -9937,10 +10444,10 @@ function ScanScreen({ route, navigation, isActive }) {
 
 // ── GIFT CARD PURCHASE ────────────────────────────────────────
 // Native rebuild of the Gift Card purchase flow — same
-// POST /wallet/gift-cards/purchase contract, PaymentSheet for the charge.
+// POST /wallet/gift-cards/purchase contract, the Clover card sheet for the charge.
 function GiftCardPurchaseScreen({ navigation, route, onHeaderBack }) {
   const customer = route?.params?.customer || null;
-  const payWithSheet = usePayWithSheet();
+  const payWithCard = usePayWithCard();
   const PRESETS = [1000, 2500, 5000, 10000];
   const [amountCents, setAmountCents] = useState(2500);
   const [customAmount, setCustomAmount] = useState('');
@@ -9967,7 +10474,7 @@ function GiftCardPurchaseScreen({ navigation, route, onHeaderBack }) {
         },
       });
       if (!ok) { showInfo('Error', data?.detail || 'Could not start purchase.'); return; }
-      const result = await payWithSheet({ clientSecret: data.client_secret, customerSessionClientSecret: data.customer_session_client_secret, customerId: data.stripe_customer_id });
+      const result = await payWithCard(data);
       if (result.canceled) return;
       if (!result.ok) { showInfo('Payment Error', result.error || 'Could not complete payment.'); return; }
       showInfo('Gift Card Purchased! 🎁', recipientEmail.trim() ? `${recipientEmail} will get an email with the card.` : 'Check your email for the gift card.',
@@ -10022,7 +10529,7 @@ function GiftCardPurchaseScreen({ navigation, route, onHeaderBack }) {
 }
 
 // ── REDEEM A GIFT CARD ────────────────────────────────────────
-// No Stripe involved — POST /wallet/gift-cards/redeem just credits the
+// No card payment involved — POST /wallet/gift-cards/redeem just credits the
 // Dasta Card balance from an existing card's code, same as web's form.
 function RedeemGiftCardScreen({ navigation, route, onHeaderBack }) {
   const customer = route?.params?.customer || null;
@@ -10406,7 +10913,6 @@ function GiftsReceivedScreen({ navigation, route, onHeaderBack }) {
     if (ok && data?.success) {
       cart?.refreshCounts?.();
       setItems(prev => prev.filter(i => i.id !== item.id));
-      showInfo('Added to Cart! 🛒', `${item.item_name_snapshot} is ready for checkout.`);
     } else {
       showInfo('Error', data?.detail || 'Could not add this gift to your cart.');
       loadReceived(); // may have been converted to credit server-side — refresh either way
@@ -11555,8 +12061,8 @@ function JoinGroupOrderScreen({ navigation, route }) {
     setLoading(false);
     return ok && data?.success ? data : null;
   };
-  // A card payment settles via Stripe's webhook a moment after the
-  // PaymentSheet closes -- right after paying, re-check a few times until
+  // A card payment can settle server-side a moment after the card
+  // sheet closes -- right after paying, re-check a few times until
   // this customer's own participation shows up.
   useEffect(() => {
     if (!groupOrderId) { setLoading(false); return; }
@@ -11877,8 +12383,8 @@ function parseDeepLink(url) {
   // renamed from 'manual_reload' to match the "Add Money" label used
   // everywhere else in the app/web) -- routes straight into the existing
   // native Add Money screen (same one MyCircleAccountScreen's "Reload
-  // Dasta Card" button already opens, POST /wallet/reload + PaymentSheet
-  // CVC confirmation) rather than any new charge mechanism. No
+  // Dasta Card" button already opens, POST /wallet/reload + the Clover
+  // card sheet) rather than any new charge mechanism. No
   // initialTabParams needed -- AddMoneyScreen reads `customer` from
   // MainTabs' own top-level route param, same as every other
   // fakeNav.navigate('AddMoney') call site.
@@ -12593,7 +13099,7 @@ export default function App() {
     // variable rather than React state.
     <SafeAreaProvider>
     <View style={{ flex: 1 }} onTouchStart={stampActivity}>
-      <StripeProvider publishableKey={STRIPE_PK} merchantIdentifier={APPLE_PAY_MERCHANT_ID}>
+      <CloverPayProvider>
         <NavigationContainer ref={navigationRef}>
           <Stack.Navigator screenOptions={{ headerShown: false }} initialRouteName="Bootstrap">
             <Stack.Screen name="Bootstrap"    component={BootstrapScreen}  />
@@ -12603,7 +13109,7 @@ export default function App() {
             <Stack.Screen name="MainTabs"     component={MainTabs}         />
           </Stack.Navigator>
         </NavigationContainer>
-      </StripeProvider>
+      </CloverPayProvider>
     </View>
     </SafeAreaProvider>
   );
@@ -12795,6 +13301,10 @@ const S = StyleSheet.create({
   micHeardEcho:      { color: C.black, fontSize: 12, fontStyle: 'italic', marginTop: 4 },
   modifierRowText:  { color: C.charcoal, fontSize: 14 },
   modifierRowPrice: { color: C.black, fontSize: 13 },
+  checkoutHalfBox:   { flex: 1, height: CHECKOUT_COMPACT_H, borderRadius: 10, borderWidth: 1, borderColor: C.border, backgroundColor: C.white, paddingHorizontal: 10, paddingVertical: 8 },
+  checkoutHalfTitle: { color: C.charcoal, fontSize: 13, fontWeight: '700' },
+  checkoutTotalRow:  { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline' },
+  checkoutTotalText: { color: C.black, fontSize: 13 },
   qtyBtn:     { width: 32, height: 32, borderRadius: 16, backgroundColor: C.white, borderWidth: 1, borderColor: C.border, alignItems: 'center', justifyContent: 'center' },
   qtyBtnText: { fontSize: 18, fontWeight: '700', color: C.charcoal },
   // Today's Discovery (2026-09-13)
