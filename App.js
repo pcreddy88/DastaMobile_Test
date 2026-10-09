@@ -1945,13 +1945,8 @@ function FavoriteDetailModal({ drink, visible, onClose, customer, navigation, on
           ? { item_type: 'food', food_item_id: drink.food_item_id, drink_name: drink.drink_name, unit_price_cents: 0, quantity: 1 }
           : { item_type: 'drink', drink_source: 'dasta_menu', dasta_menu_item_id: drink.dasta_menu_item_id, selected_modifier_ids: catalogModifierIds(), unit_price_cents: 0, quantity: 1 };
         const { ok, data } = await cart.addToCart(payload);
-        // onOk defers the actual onClose() until the customer dismisses
-        // the InfoModal -- unlike Alert.alert (an OS-level overlay), this
-        // modal lives inside FavoriteDetailModal's own render tree and
-        // would vanish instantly if onClose() fired synchronously (it
-        // sets the parent's `visible` false, and line ~1204's early
-        // return unmounts everything, InfoModal included).
-        if (ok && data?.success) showInfo('Added to Cart 🛒', `${drink.drink_name} — added to your order!`, onClose);
+        // No "Added to Cart" popup -- the header's cart badge shows it.
+        if (ok && data?.success) onClose();
         else showInfo('Error', data?.detail || 'Could not add to your order.');
       } else {
         // Custom/Circle/Menu sip — same presetDrink path the Order tab's
@@ -4106,9 +4101,6 @@ function OrderScreen({ route, navigation, onHeaderBack }) {
             await apiFetch('/sip/craft-the-sip', { method: 'POST', body: { custom_drink_id: data.custom_drink_id } });
           } catch {}
           setBuilding(false);
-          showInfo('Added to Cart 🛒', `${drink.custom_drink?.drink_name || 'Your custom sip'} is built and in your cart — checkout whenever you're ready.`);
-        } else {
-          showInfo('Added to Cart 🛒', `${drink.custom_drink?.drink_name || 'Your custom sip'} is in your cart — checkout whenever you're ready.`);
         }
       } else {
         showInfo('Error', data?.detail || 'Could not add to cart.');
@@ -4138,7 +4130,6 @@ function OrderScreen({ route, navigation, onHeaderBack }) {
       });
       if (ok && data?.success) {
         setCircleOrdered(true);
-        showInfo('Added to Cart 🛒', `${circle.drink_name} is in your cart — checkout whenever you're ready.`);
       } else {
         showInfo('Error', data?.detail || 'Could not add to cart.');
       }
@@ -4164,7 +4155,6 @@ function OrderScreen({ route, navigation, onHeaderBack }) {
       });
       if (ok && data?.success) {
         setMenuOrdered(true);
-        showInfo('Added to Cart 🛒', `${menu.drink_name} is in your cart — checkout whenever you're ready.`);
       } else {
         showInfo('Error', data?.detail || 'Could not add to cart.');
       }
@@ -8598,7 +8588,6 @@ function PairingPanel({ pairing, drink, drinkName, price, selectedSize, customer
         pair_with_cart_item_id: drinkRes.data.cart_item_id,
       });
       if (foodRes.ok && foodRes.data?.success) {
-        showInfo('Wombo Combo! 🎉', `${name} (${selectedSize}oz) + ${best.food_name} — $${comboAmt.toFixed(2)} added to your order!`);
         navigation.navigate('Cart', { customer });
       } else {
         showInfo('Error', 'Could not add the full combo to your order.');
@@ -8616,7 +8605,6 @@ function PairingPanel({ pairing, drink, drinkName, price, selectedSize, customer
         description: best.pairing_reason || '', quantity: 1, unit_price_cents: Math.round(foodAmt * 100),
       });
       if (ok && data?.success) {
-        showInfo('Added to Cart 🍽', `${best.food_name} — $${foodAmt.toFixed(2)} added to your order!`);
         navigation.navigate('Cart', { customer });
       } else {
         showInfo('Error', 'Could not add to your order.');
@@ -8638,7 +8626,6 @@ function PairingPanel({ pairing, drink, drinkName, price, selectedSize, customer
       });
       if (ok && data?.success) {
         await craftIfNeeded(data.custom_drink_id);
-        showInfo('Added to Cart 🥤', `${name} (${selectedSize}oz) — $${drinkAmt.toFixed(2)} added to your order!`);
         navigation.navigate('Cart', { customer });
       } else {
         showInfo('Error', 'Could not add to your order.');
@@ -10926,7 +10913,6 @@ function GiftsReceivedScreen({ navigation, route, onHeaderBack }) {
     if (ok && data?.success) {
       cart?.refreshCounts?.();
       setItems(prev => prev.filter(i => i.id !== item.id));
-      showInfo('Added to Cart! 🛒', `${item.item_name_snapshot} is ready for checkout.`);
     } else {
       showInfo('Error', data?.detail || 'Could not add this gift to your cart.');
       loadReceived(); // may have been converted to credit server-side — refresh either way
